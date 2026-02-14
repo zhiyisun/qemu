@@ -61,6 +61,10 @@ void pcie_sriov_pf_init(PCIDevice *dev, uint16_t offset,
     pci_set_word(cfg + PCI_SRIOV_TOTAL_VF, total_vfs);
     pci_set_word(cfg + PCI_SRIOV_NUM_VF, 0);
 
+    /* Set SR-IOV capabilities - enable VF Migration (VFM) to allow
+     * flexible VF numbers (nr_virtfn != initial_vfs) */
+    pci_set_long(cfg + PCI_SRIOV_CAP, PCI_SRIOV_CAP_VFM);
+
     /* Write enable control bits */
     wmask = dev->wmask + offset;
     pci_set_word(wmask + PCI_SRIOV_CTRL,
@@ -156,10 +160,6 @@ static PCIDevice *register_vf(PCIDevice *pf, int devfn, const char *name,
         return NULL;
     }
 
-    /* set vid/did according to sr/iov spec - they are not used */
-    pci_config_set_vendor_id(dev->config, 0xffff);
-    pci_config_set_device_id(dev->config, 0xffff);
-
     return dev;
 }
 
@@ -180,6 +180,8 @@ static void register_vfs(PCIDevice *dev)
         return;
     }
 
+    error_report("SR-IOV: enabling %u VFs for %s", num_vfs, dev->name);
+
     dev->exp.sriov_pf.vf = g_new(PCIDevice *, num_vfs);
 
     trace_sriov_register_vfs(dev->name, PCI_SLOT(dev->devfn),
@@ -188,6 +190,7 @@ static void register_vfs(PCIDevice *dev)
         dev->exp.sriov_pf.vf[i] = register_vf(dev, devfn,
                                               dev->exp.sriov_pf.vfname, i);
         if (!dev->exp.sriov_pf.vf[i]) {
+            error_report("SR-IOV: failed to realize VF %u for %s", i, dev->name);
             num_vfs = i;
             break;
         }
@@ -235,6 +238,9 @@ void pcie_sriov_config_write(PCIDevice *dev, uint32_t address,
                              PCI_FUNC(dev->devfn), off, val, len);
 
     if (range_covers_byte(off, len, PCI_SRIOV_CTRL)) {
+        error_report("SR-IOV: %s ctrl write 0x%x (num_vf=%u)",
+                     dev->name, val, pci_get_word(dev->config + sriov_cap +
+                                                   PCI_SRIOV_NUM_VF));
         if (dev->exp.sriov_pf.num_vfs) {
             if (!(val & PCI_SRIOV_CTRL_VFE)) {
                 unregister_vfs(dev);
@@ -244,6 +250,12 @@ void pcie_sriov_config_write(PCIDevice *dev, uint32_t address,
                 register_vfs(dev);
             }
         }
+    }
+
+    if (range_covers_byte(off, len, PCI_SRIOV_NUM_VF)) {
+        uint16_t num_vfs = pci_get_word(dev->config + sriov_cap +
+                                        PCI_SRIOV_NUM_VF);
+        error_report("SR-IOV: %s num_vf write %u", dev->name, num_vfs);
     }
 }
 

@@ -20,3 +20,10 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# Build artifacts
+subprojects/.wraplock
+
+# Test logs
+tools/test_output.log
+tools/test_output*.log

@@ -179,6 +179,7 @@ static void kvm_apic_external_nmi(APICCommonState *s)
     run_on_cpu(CPU(s->cpu), do_inject_external_nmi, RUN_ON_CPU_HOST_PTR(s));
 }
 
+static int kvm_send_msi_count = 0;
 static void kvm_send_msi(MSIMessage *msg)
 {
     int ret;
@@ -195,6 +196,12 @@ static void kvm_send_msi(MSIMessage *msg)
         fprintf(stderr, "KVM: injection failed, MSI lost (%s)\n",
                 strerror(-ret));
     }
+    /* Log return value for debugging */
+    if (kvm_send_msi_count < 50 && (msg->data != 0x20 || (msg->address & 0xFFF) != 0)) {
+        fprintf(stderr, "kvm-send-msi: addr=0x%lx data=0x%x ret=%d\n",
+                (unsigned long)msg->address, msg->data, ret);
+        kvm_send_msi_count++;
+    }
 }
 
 static uint64_t kvm_apic_mem_read(void *opaque, hwaddr addr,
@@ -203,11 +210,20 @@ static uint64_t kvm_apic_mem_read(void *opaque, hwaddr addr,
     return ~(uint64_t)0;
 }
 
+static int kvm_apic_mem_write_count = 0;
 static void kvm_apic_mem_write(void *opaque, hwaddr addr,
                                uint64_t data, unsigned size)
 {
     MSIMessage msg = { .address = addr, .data = data };
 
+    /* Log non-AHCI MSI writes */
+    if (data != 0x20 || addr != 0x3000) {
+        if (kvm_apic_mem_write_count < 50) {
+            fprintf(stderr, "kvm-apic: NON-AHCI mem_write addr=0x%lx data=0x%lx size=%u\n",
+                    (unsigned long)addr, (unsigned long)data, size);
+            kvm_apic_mem_write_count++;
+        }
+    }
     kvm_send_msi(&msg);
 }
 

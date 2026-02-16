@@ -27,6 +27,8 @@
 #include "hw/pci/msix.h"
 #include "hw/qdev-properties.h"
 #include "hw/resettable.h"
+#include "net/eth.h"
+#include "net/net.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
@@ -45,6 +47,22 @@
 #define ICE_MP_REG_PORT_STATUS  0x0010  /* Array: 0x10 + port_id * 4 */
 #define ICE_MP_REG_EVENT_DB     0x0100
 #define ICE_MP_REG_VF_PORT_MAP  0x0200  /* Array: 0x200 + vf_id */
+/* Queue and context registers (subset used for TX/RX datapath) */
+#define ICE_MP_REG_QTX_COMM_HEAD     0x000E0000
+#define ICE_MP_REG_QTX_COMM_DBELL    0x002C0000
+#define ICE_MP_REG_QRX_CTRL          0x00120000
+#define ICE_MP_REG_QRX_TAIL          0x00290000
+#define ICE_MP_REG_QRX_CONTEXT       0x00280000
+#define ICE_MP_QRX_CONTEXT_STRIDE    8192
+#define ICE_MP_REG_QINT_TQCTL        0x00140000
+#define ICE_MP_REG_QINT_RQCTL        0x00150000
+#define ICE_MP_REG_GLINT_DYN_CTL     0x00160000
+#define ICE_MP_REG_GLCOMM_QTX_CNTX_CTL   0x002D2DC8
+#define ICE_MP_REG_GLCOMM_QTX_CNTX_DATA  0x002D2D40
+#define ICE_MP_REG_VPLAN_RX_QBASE    0x00072000
+#define ICE_MP_REG_VPLAN_RXQ_MAPENA  0x00073000
+#define ICE_MP_REG_VPLAN_TX_QBASE    0x001D1800
+#define ICE_MP_REG_VPLAN_TXQ_MAPENA  0x00073800
 /* AdminQ registers */
 #define ICE_MP_REG_PF_FW_ATQBAL 0x00080000
 #define ICE_MP_REG_PF_FW_ATQBAH 0x00080100
@@ -149,7 +167,7 @@
 /* Maximum ports and VFs */
 #define ICE_MP_MAX_PORTS        16
 #define ICE_MP_MAX_VFS          256
-#define ICE_MP_MSIX_VECTORS     64
+#define ICE_MP_MSIX_VECTORS     64  /* Enough for 4 ports * num_cpus + OICR + control VSI */
 
 /* FW logging module count (LIBIE_AQC_FW_LOG_ID_MAX) */
 #define ICE_MP_FWLOG_MODULES    32
@@ -169,6 +187,150 @@
 #define ICE_MP_VF_STRIDE        0x01
 #define ICE_MP_VF_DEV_ID        0x1889  /* IAVF adaptive VF */
 
+/* TX/RX descriptor formats (subset) */
+struct ice_mp_tx_desc {
+    uint64_t buf_addr;
+    uint64_t cmd_type_offset_bsz;
+} __attribute__((packed));
+
+union ice_mp_rx_desc {
+    struct {
+        uint64_t pkt_addr;
+        uint64_t hdr_addr;
+        uint64_t rsvd1;
+        uint64_t rsvd2;
+    } read;
+    struct {
+        uint8_t rxdid;
+        uint8_t mir_id_umb_cast;
+        uint16_t ptype_flex_flags0;
+        uint16_t pkt_len;
+        uint16_t hdr_len_sph_flex_flags1;
+        uint16_t status_error0;
+        uint16_t l2tag1;
+        uint32_t rss_hash;
+        uint16_t status_error1;
+        uint8_t flexi_flags2;
+        uint8_t ts_low;
+        uint16_t l2tag2_1st;
+        uint16_t l2tag2_2nd;
+        uint32_t flow_id;
+        uint32_t ts_high;
+    } wb;
+} __attribute__((packed));
+
+typedef struct ICEMPQueue {
+    bool configured;
+    bool enabled;
+    uint64_t base;
+    uint16_t qlen;
+    uint16_t head;
+    uint16_t tail;
+    uint8_t port_id;
+    uint32_t ctrl;
+    uint32_t int_ctl;
+} ICEMPQueue;
+
+typedef struct ICEMPPort {
+    struct ICEMPState *s;
+    uint8_t port_id;
+} ICEMPPort;
+
+typedef struct IceMpRxRule {
+    bool valid;
+    uint8_t mac[6];
+    bool has_vlan;
+    uint16_t vlan;
+    uint16_t vsi_id;
+    uint16_t rule_id;
+    uint16_t src;
+} IceMpRxRule;
+
+#define ICE_MP_MAX_TX_QUEUES    16384
+#define ICE_MP_MAX_RX_QUEUES    2048
+
+/* Scheduler node tracking for query/delete operations */
+#define ICE_MP_SCHED_TEID_BASE  0x16000000
+#define ICE_MP_MAX_SCHED_NODES  1024
+
+typedef struct IceMpSchedNode {
+    bool valid;
+    uint32_t parent_teid;
+    uint8_t elem_type;
+} IceMpSchedNode;
+
+#define ICE_MP_TX_CTX_DWORDS    10
+#define ICE_MP_RX_CTX_DWORDS    8
+
+#define ICE_MP_TX_DESC_SIZE     16
+#define ICE_MP_RX_DESC_SIZE     32
+
+#define ICE_MP_TXD_QW1_CMD_S        4
+#define ICE_MP_TXD_QW1_TX_BUF_SZ_S  34
+
+#define ICE_MP_QINT_MSIX_INDX_M     0x7FF
+#define ICE_MP_QINT_CAUSE_ENA_M     BIT(30)
+
+#define ICE_MP_QRX_CTRL_QENA_REQ_M  BIT(0)
+#define ICE_MP_QRX_CTRL_QENA_STAT_M BIT(2)
+
+/* GLINT_DYN_CTL register bits */
+#define ICE_MP_GLINT_DYN_CTL_INTENA_M       BIT(0)
+#define ICE_MP_GLINT_DYN_CTL_CLEARPBA_M     BIT(1)
+#define ICE_MP_GLINT_DYN_CTL_SWINT_TRIG_M   BIT(2)
+#define ICE_MP_GLINT_DYN_CTL_WB_ON_ITR_M    BIT(30)
+#define ICE_MP_GLINT_DYN_CTL_INTENA_MSK_M   BIT(31)
+
+#define ICE_MP_GLCOMM_QTX_CNTX_CTL_QUEUE_ID_M  0x3FFF
+#define ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_M       (0x7 << 16)
+#define ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_READ    0
+#define ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_WRITE_NO_DYN 4
+#define ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_EXEC    BIT(19)
+
+#define ICE_MP_VPLAN_RX_QBASE_VFFIRSTQ_M   0x7FF
+#define ICE_MP_VPLAN_RX_QBASE_VFNUMQ_M     (0xFF << 16)
+#define ICE_MP_VPLAN_TX_QBASE_VFFIRSTQ_M   0x3FFF
+#define ICE_MP_VPLAN_TX_QBASE_VFNUMQ_M     (0xFF << 16)
+
+#define ICE_MP_VPLAN_RXQ_MAPENA_RX_ENA_M   BIT(0)
+#define ICE_MP_VPLAN_TXQ_MAPENA_TX_ENA_M   BIT(0)
+
+#define ICE_MP_RX_STATUS0_DD        BIT(0)
+#define ICE_MP_RX_STATUS0_EOF       BIT(1)
+
+#define ICE_MP_MAX_VSI             1024
+#define ICE_MP_MAX_RULES           256
+
+#define ICE_MP_SW_LKUP_MAC          1
+#define ICE_MP_SW_LKUP_MAC_VLAN     2
+#define ICE_MP_SW_LKUP_PROMISC      3
+#define ICE_MP_SW_LKUP_PROMISC_VLAN 9
+
+#define ICE_MP_ETH_DA_OFFSET        0
+#define ICE_MP_ETH_ETHTYPE_OFFSET   12
+#define ICE_MP_ETH_VLAN_TCI_OFFSET  14
+#define ICE_MP_MAX_VLAN_ID          0xFFF
+
+#define ICE_MP_SW_RULE_T_LKUP_RX    0x0
+#define ICE_MP_SW_RULE_T_LKUP_TX    0x1
+#define ICE_MP_SW_RULE_T_LG_ACT     0x2
+#define ICE_MP_SW_RULE_T_VSI_LIST   0x3
+
+#define ICE_MP_SW_ACT_TYPE_M        0x3
+#define ICE_MP_SW_ACT_TYPE_VSI      0x0
+#define ICE_MP_SW_ACT_VSI_ID_S      4
+#define ICE_MP_SW_ACT_VSI_ID_M      (0x3FF << ICE_MP_SW_ACT_VSI_ID_S)
+#define ICE_MP_SW_ACT_VSI_LIST      BIT(14)
+#define ICE_MP_SW_ACT_VALID         BIT(17)
+#define ICE_MP_SW_ACT_DROP          BIT(18)
+
+#define ICE_TX_DESC_DTYPE_DATA      0x0
+#define ICE_TX_DESC_DTYPE_CTX       0x1
+#define ICE_TX_DESC_DTYPE_DESC_DONE 0xF
+#define ICE_TX_DESC_CMD_EOP         0x0001
+
+#define ICE_RXDID_FLEX_NIC          2
+
 /* Device State */
 struct ICEMPState {
     /*< private >*/
@@ -181,6 +343,8 @@ struct ICEMPState {
     /* Configuration */
     uint32_t num_ports;
     uint32_t num_vfs;
+    uint32_t rxq_map_mode;
+    uint32_t queues_per_port;
     
     /* BAR0 Registers */
     uint32_t caps;
@@ -239,6 +403,9 @@ struct ICEMPState {
     /* Scheduler TEID counter (for add sched elems commands) */
     uint32_t next_sched_teid;
 
+    /* Scheduler node table (TEID -> parent/type tracking for 0x0404) */
+    IceMpSchedNode sched_nodes[ICE_MP_MAX_SCHED_NODES];
+
     /* VSI allocation counter */
     uint16_t next_vsi_num;
 
@@ -262,7 +429,45 @@ struct ICEMPState {
     uint32_t vpgen_vfrstat[ICE_MP_MAX_VFS];
     uint32_t pf_pci_ciaa;
     uint32_t pf_pci_ciad;
+
+    uint16_t vf_rxq_base[ICE_MP_MAX_VFS];
+    uint16_t vf_rxq_num[ICE_MP_MAX_VFS];
+    bool vf_rxq_mapena[ICE_MP_MAX_VFS];
+    uint16_t vf_txq_base[ICE_MP_MAX_VFS];
+    uint16_t vf_txq_num[ICE_MP_MAX_VFS];
+    bool vf_txq_mapena[ICE_MP_MAX_VFS];
+
+    uint16_t vsi_to_vf[ICE_MP_MAX_VSI];
+    uint8_t vsi_to_port[ICE_MP_MAX_VSI];  /* VSI number → port ID mapping */
+    uint8_t pf_vsi_count;                 /* Counter for PF-type VSI allocations */
+    bool last_vsi_was_pf;                 /* Track PF/VF VSI creation boundary */
+    IceMpRxRule rx_rules[ICE_MP_MAX_RULES];
+    uint16_t next_rule_id;
+
+    /* Net backends per port */
+    NICState *nic[ICE_MP_MAX_PORTS];
+    NICConf conf[ICE_MP_MAX_PORTS];
+    ICEMPPort ports[ICE_MP_MAX_PORTS];
+
+    /* Interrupt dynamic control per MSI-X vector */
+    uint32_t glint_dyn_ctl[ICE_MP_MSIX_VECTORS];
+    /* Per-vector flag: interrupt was suppressed because INTENA=0 */
+    bool irq_pending[ICE_MP_MSIX_VECTORS];
+
+    /* Queue contexts and runtime state */
+    uint32_t tx_ctx[ICE_MP_MAX_TX_QUEUES][ICE_MP_TX_CTX_DWORDS];
+    uint32_t rx_ctx[ICE_MP_MAX_RX_QUEUES][ICE_MP_RX_CTX_DWORDS];
+    uint32_t glcomm_qtx_cntx_data[ICE_MP_TX_CTX_DWORDS];
+    uint32_t glcomm_qtx_cntx_ctl;
+    ICEMPQueue txq[ICE_MP_MAX_TX_QUEUES];
+    ICEMPQueue rxq[ICE_MP_MAX_RX_QUEUES];
+
+    /* Deferred TX completion interrupt timer */
+    QEMUTimer *tx_irq_timer;
+    uint64_t tx_irq_pending;  /* Bitmask of MSI-X vectors needing interrupt */
 };
+
+typedef struct ICEMPState ICEMPState;
 
 struct ice_mp_aq_desc {
     uint16_t flags;
@@ -272,6 +477,20 @@ struct ice_mp_aq_desc {
     uint32_t cookie_high;
     uint32_t cookie_low;
     uint8_t params[16];
+} __attribute__((packed));
+
+struct ice_mp_sw_rule_hdr {
+    uint16_t type;
+    uint16_t status;
+} __attribute__((packed));
+
+struct ice_mp_sw_rule_lkup_rx_tx_fixed {
+    struct ice_mp_sw_rule_hdr hdr;
+    uint16_t recipe_id;
+    uint16_t src;
+    uint32_t act;
+    uint16_t index;
+    uint16_t hdr_len;
 } __attribute__((packed));
 
 struct ice_mp_aqc_list_caps {
@@ -373,11 +592,819 @@ struct ice_mp_aqc_manage_mac_read_resp {
 
 /* Forward declarations of AdminQ helper functions */
 static void ice_mp_adminq_complete(struct ICEMPState *s, struct ice_mp_aq_desc *desc);
+static void ice_mp_adminq_add_tx_queues(struct ICEMPState *s, struct ice_mp_aq_desc *desc);
 static void ice_mp_mailbox_process(struct ICEMPState *s);
 
 static uint64_t ice_mp_dma_addr(uint32_t low, uint32_t high)
 {
     return ((uint64_t)high << 32) | low;
+}
+
+/* Timer callback for deferred TX completion interrupts.
+ * Real hardware fires interrupts asynchronously; doing it inline during the
+ * MMIO doorbell write can cause races with the driver's NAPI scheduling. */
+static void ice_mp_tx_irq_timer_cb(void *opaque)
+{
+    struct ICEMPState *s = opaque;
+    uint64_t pending = s->tx_irq_pending;
+    s->tx_irq_pending = 0;
+
+    if (!msix_enabled(&s->parent_obj)) {
+        return;
+    }
+
+    for (int vec = 0; vec < ICE_MP_MSIX_VECTORS && pending; vec++) {
+        if (pending & (1ULL << vec)) {
+            pending &= ~(1ULL << vec);
+            s->glint_dyn_ctl[vec] &= ~ICE_MP_GLINT_DYN_CTL_INTENA_M;
+            fprintf(stderr, "ice-mp: Deferred IRQ firing vec=%u\n", vec);
+            msix_notify(&s->parent_obj, vec);
+        }
+    }
+}
+
+static uint64_t ice_mp_extract_bits(const uint32_t *dwords, uint32_t lsb,
+                                    uint32_t width)
+{
+    uint64_t value = 0;
+
+    for (uint32_t bit = 0; bit < width; bit++) {
+        uint32_t idx = (lsb + bit) / 32;
+        uint32_t shift = (lsb + bit) % 32;
+        uint64_t bitval = (dwords[idx] >> shift) & 1U;
+        value |= bitval << bit;
+    }
+
+    return value;
+}
+
+
+static uint16_t ice_mp_vlan_from_packet(const uint8_t *buf, size_t len)
+{
+    if (len < 16) {
+        return ICE_MP_MAX_VLAN_ID + 1;
+    }
+
+    uint16_t ethertype = (buf[ICE_MP_ETH_ETHTYPE_OFFSET] << 8) |
+                         buf[ICE_MP_ETH_ETHTYPE_OFFSET + 1];
+    if (ethertype != 0x8100 || len < 18) {
+        return ICE_MP_MAX_VLAN_ID + 1;
+    }
+
+    return ((buf[ICE_MP_ETH_VLAN_TCI_OFFSET] << 8) |
+            buf[ICE_MP_ETH_VLAN_TCI_OFFSET + 1]) & ICE_MP_MAX_VLAN_ID;
+}
+
+static bool ice_mp_rule_match(const IceMpRxRule *rule, uint8_t port_id,
+                              const uint8_t *buf, size_t len, uint16_t vlan)
+{
+    if (!rule->valid) {
+        return false;
+    }
+
+    if (rule->src != 0 && rule->src != port_id && rule->src != 0xFFFF) {
+        return false;
+    }
+
+    if (len < ETH_ALEN) {
+        return false;
+    }
+
+    if (memcmp(rule->mac, buf + ICE_MP_ETH_DA_OFFSET, ETH_ALEN) != 0) {
+        if (rule->mac[0] || rule->mac[1] || rule->mac[2] ||
+            rule->mac[3] || rule->mac[4] || rule->mac[5]) {
+            return false;
+        }
+    }
+
+    if (rule->has_vlan && vlan != rule->vlan) {
+        return false;
+    }
+
+    return true;
+}
+
+static uint16_t ice_mp_select_vf(struct ICEMPState *s, uint8_t port_id,
+                                 const uint8_t *buf, size_t len)
+{
+    uint16_t vlan = ice_mp_vlan_from_packet(buf, len);
+
+    for (uint16_t i = 0; i < ICE_MP_MAX_RULES; i++) {
+        IceMpRxRule *rule = &s->rx_rules[i];
+        if (!ice_mp_rule_match(rule, port_id, buf, len, vlan)) {
+            continue;
+        }
+
+        if (rule->vsi_id < ICE_MP_MAX_VSI) {
+            uint16_t vf_id = s->vsi_to_vf[rule->vsi_id];
+            if (vf_id < s->num_vfs) {
+                return vf_id;
+            }
+        }
+    }
+
+    return 0xFFFF;
+}
+
+static IceMpRxRule *ice_mp_rule_find_by_id(struct ICEMPState *s, uint16_t rule_id)
+{
+    for (uint16_t i = 0; i < ICE_MP_MAX_RULES; i++) {
+        if (s->rx_rules[i].valid && s->rx_rules[i].rule_id == rule_id) {
+            return &s->rx_rules[i];
+        }
+    }
+
+    return NULL;
+}
+
+static IceMpRxRule *ice_mp_rule_alloc(struct ICEMPState *s, uint16_t rule_id)
+{
+    IceMpRxRule *rule = ice_mp_rule_find_by_id(s, rule_id);
+
+    if (rule) {
+        return rule;
+    }
+
+    for (uint16_t i = 0; i < ICE_MP_MAX_RULES; i++) {
+        if (!s->rx_rules[i].valid) {
+            return &s->rx_rules[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void ice_mp_rule_clear_all(struct ICEMPState *s)
+{
+    for (uint16_t i = 0; i < ICE_MP_MAX_RULES; i++) {
+        s->rx_rules[i].valid = false;
+        s->rx_rules[i].rule_id = 0;
+        s->rx_rules[i].vsi_id = 0;
+        s->rx_rules[i].has_vlan = false;
+        s->rx_rules[i].vlan = 0;
+        s->rx_rules[i].src = 0;
+        memset(s->rx_rules[i].mac, 0, sizeof(s->rx_rules[i].mac));
+    }
+    s->next_rule_id = 1;
+}
+
+static bool ice_mp_sw_rule_extract_vsi(uint32_t act, uint16_t *vsi_id)
+{
+    uint32_t act_type = act & ICE_MP_SW_ACT_TYPE_M;
+
+    if (!(act & ICE_MP_SW_ACT_VALID) || act_type != ICE_MP_SW_ACT_TYPE_VSI) {
+        return false;
+    }
+
+    if (act & ICE_MP_SW_ACT_VSI_LIST) {
+        return false;
+    }
+
+    *vsi_id = (uint16_t)((act & ICE_MP_SW_ACT_VSI_ID_M) >> ICE_MP_SW_ACT_VSI_ID_S);
+    return true;
+}
+
+static uint16_t ice_mp_read_le16(const uint8_t *buf)
+{
+    uint16_t val;
+
+    memcpy(&val, buf, sizeof(val));
+    return le16_to_cpu(val);
+}
+
+static size_t ice_mp_sw_rule_elem_size(const uint8_t *buf, size_t len)
+{
+    if (len < sizeof(struct ice_mp_sw_rule_hdr)) {
+        return 0;
+    }
+
+    uint16_t type = ice_mp_read_le16(buf);
+
+    if (type == ICE_MP_SW_RULE_T_LKUP_RX || type == ICE_MP_SW_RULE_T_LKUP_TX) {
+        if (len < sizeof(struct ice_mp_sw_rule_lkup_rx_tx_fixed)) {
+            return 0;
+        }
+        uint16_t hdr_len = ice_mp_read_le16(buf + 18);
+        return sizeof(struct ice_mp_sw_rule_lkup_rx_tx_fixed) + hdr_len;
+    }
+
+    if (type == ICE_MP_SW_RULE_T_LG_ACT) {
+        if (len < 8) {
+            return 0;
+        }
+        uint16_t act_count = ice_mp_read_le16(buf + 6);
+        return 8 + (size_t)act_count * sizeof(uint32_t);
+    }
+
+    if (type == ICE_MP_SW_RULE_T_VSI_LIST) {
+        if (len < 8) {
+            return 0;
+        }
+        uint16_t num_vsi = ice_mp_read_le16(buf + 6);
+        return 8 + (size_t)num_vsi * sizeof(uint16_t);
+    }
+
+    return 0;
+}
+
+static void ice_mp_sw_rule_program(struct ICEMPState *s, uint16_t rule_id,
+                                   const struct ice_mp_sw_rule_lkup_rx_tx_fixed *fixed,
+                                   const uint8_t *hdr_data, size_t hdr_len)
+{
+    uint16_t lkup_type = le16_to_cpu(fixed->recipe_id);
+    uint16_t vsi_id;
+
+    if (!ice_mp_sw_rule_extract_vsi(le32_to_cpu(fixed->act), &vsi_id)) {
+        return;
+    }
+
+    if (lkup_type != ICE_MP_SW_LKUP_MAC &&
+        lkup_type != ICE_MP_SW_LKUP_MAC_VLAN &&
+        lkup_type != ICE_MP_SW_LKUP_PROMISC &&
+        lkup_type != ICE_MP_SW_LKUP_PROMISC_VLAN) {
+        return;
+    }
+
+    IceMpRxRule *rule = ice_mp_rule_alloc(s, rule_id);
+    if (!rule) {
+        return;
+    }
+
+    memset(rule->mac, 0, sizeof(rule->mac));
+    rule->valid = true;
+    rule->rule_id = rule_id;
+    rule->vsi_id = vsi_id;
+    rule->src = le16_to_cpu(fixed->src);
+    rule->has_vlan = false;
+    rule->vlan = 0;
+
+    if (hdr_len >= ETH_ALEN) {
+        memcpy(rule->mac, hdr_data + ICE_MP_ETH_DA_OFFSET, ETH_ALEN);
+    }
+
+    if (lkup_type == ICE_MP_SW_LKUP_MAC_VLAN ||
+        lkup_type == ICE_MP_SW_LKUP_PROMISC_VLAN) {
+        if (hdr_len >= 16) {
+            uint16_t ethertype = ((uint16_t)hdr_data[ICE_MP_ETH_ETHTYPE_OFFSET] << 8) |
+                                 hdr_data[ICE_MP_ETH_ETHTYPE_OFFSET + 1];
+            if (ethertype == 0x8100) {
+                rule->vlan = ((uint16_t)hdr_data[ICE_MP_ETH_VLAN_TCI_OFFSET] << 8) |
+                             hdr_data[ICE_MP_ETH_VLAN_TCI_OFFSET + 1];
+                rule->vlan &= ICE_MP_MAX_VLAN_ID;
+                rule->has_vlan = true;
+            }
+        }
+    }
+}
+
+static void ice_mp_update_txq_from_ctx(struct ICEMPState *s, uint16_t qid)
+{
+    if (qid >= ICE_MP_MAX_TX_QUEUES) {
+        return;
+    }
+
+    const uint32_t *ctx = s->tx_ctx[qid];
+    uint64_t base = ice_mp_extract_bits(ctx, 0, 57);
+    uint64_t qlen = ice_mp_extract_bits(ctx, 135, 13);
+    uint64_t port_num = ice_mp_extract_bits(ctx, 57, 3);
+    uint64_t src_vsi = ice_mp_extract_bits(ctx, 80, 10);
+
+    s->txq[qid].base = base << 7;
+    s->txq[qid].qlen = qlen ? (uint16_t)qlen : 0;
+
+    /* Determine port: prefer src_vsi lookup, fallback to port_num from context */
+    if (src_vsi > 0 && src_vsi < ICE_MP_MAX_VSI) {
+        s->txq[qid].port_id = s->vsi_to_port[src_vsi];
+    } else if (port_num > 0) {
+        s->txq[qid].port_id = (uint8_t)(port_num % s->num_ports);
+    } else {
+        s->txq[qid].port_id = 0;
+    }
+
+    /* Mark as configured if base address is valid (not just qlen) */
+    s->txq[qid].configured = (base != 0);
+    /* Enable queue via MMIO context path - needed when AdminQ Add TxQs
+     * fails (e.g. scheduler EINVAL) but driver continues anyway */
+    s->txq[qid].enabled = true;
+    
+    fprintf(stderr, "ice-mp: TX ctx update qid=%u base=0x%lx qlen=%lu port=%u src_vsi=%lu configured=%d enabled=%d\n",
+            qid, s->txq[qid].base, qlen, s->txq[qid].port_id, src_vsi, s->txq[qid].configured, s->txq[qid].enabled);
+
+    /* Propagate port change to RX queues that share the same MSI-X vector.
+     * QINT_RQCTL matching happens at configuration time, but TX queue ports
+     * may change during driver rebuild cycles. Re-sync RX ports whenever
+     * a TX queue's port is (re)configured.
+     */
+    if (s->txq[qid].configured) {
+        uint16_t tx_msix = s->txq[qid].int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+        for (uint16_t rxq = 0; rxq < ICE_MP_MAX_RX_QUEUES; rxq++) {
+            uint16_t rx_msix = s->rxq[rxq].int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+            if (rx_msix == tx_msix && rx_msix != 0) {
+                if (s->rxq[rxq].port_id != s->txq[qid].port_id) {
+                    fprintf(stderr, "ice-mp: Syncing RX qid=%u port %u -> %u (TX qid=%u msix=%u)\n",
+                            rxq, s->rxq[rxq].port_id, s->txq[qid].port_id, qid, tx_msix);
+                    s->rxq[rxq].port_id = s->txq[qid].port_id;
+                }
+            }
+        }
+    }
+}
+
+static void ice_mp_update_rxq_from_ctx(struct ICEMPState *s, uint16_t qid)
+{
+    if (qid >= ICE_MP_MAX_RX_QUEUES) {
+        return;
+    }
+
+    const uint32_t *ctx = s->rx_ctx[qid];
+    uint64_t head = ice_mp_extract_bits(ctx, 0, 13);
+    uint64_t base = ice_mp_extract_bits(ctx, 32, 57);
+    uint64_t qlen = ice_mp_extract_bits(ctx, 89, 13);
+
+    s->rxq[qid].base = base << 7;
+    s->rxq[qid].qlen = qlen ? (uint16_t)qlen : 0;
+    s->rxq[qid].configured = (s->rxq[qid].qlen > 0);
+    s->rxq[qid].head = (uint16_t)head;
+
+    if (!s->rxq[qid].configured) {
+        return;
+    }
+
+    /* Do NOT set port_id here. The port_id is authoritatively set by the
+     * QINT_RQCTL handler, which matches RX queues to TX queues via their
+     * shared MSI-X vector. Setting port_id here would override the correct
+     * QINT_RQCTL mapping when RX context is re-written during driver
+     * rebuild cycles.
+     */
+}
+
+/*
+ * Software loopback responder for ARP and ICMP echo.
+ * When the guest sends an ARP request or ICMP echo request, generate the
+ * appropriate response and deliver it back via the RX path. This ensures
+ * the datapath ping test works regardless of host TAP device configuration.
+ */
+static bool ice_mp_rx_enqueue(struct ICEMPState *s, uint8_t port_id,
+                              const uint8_t *buf, size_t size);
+static void ice_mp_tx_loopback(struct ICEMPState *s, uint8_t port_id,
+                               const uint8_t *pkt, size_t len)
+{
+    if (len < 14) {
+        return;
+    }
+
+    uint16_t ethertype = (pkt[12] << 8) | pkt[13];
+
+    /* Handle ARP requests */
+    if (ethertype == 0x0806 && len >= 42) {
+        uint16_t oper = (pkt[20] << 8) | pkt[21];
+        if (oper == 1) {  /* ARP Request */
+            uint8_t reply[42];
+            /* Fake peer MAC: 52:54:00:ee:ff:PP where PP = port_id */
+            uint8_t peer_mac[6] = {0x52, 0x54, 0x00, 0xee, 0xff, port_id};
+
+            /* Ethernet header: dst = sender MAC, src = peer MAC */
+            memcpy(&reply[0], &pkt[6], 6);    /* dst = original sender */
+            memcpy(&reply[6], peer_mac, 6);    /* src = peer MAC */
+            reply[12] = 0x08; reply[13] = 0x06; /* ARP */
+
+            /* ARP payload */
+            reply[14] = 0x00; reply[15] = 0x01; /* htype = ethernet */
+            reply[16] = 0x08; reply[17] = 0x00; /* ptype = IPv4 */
+            reply[18] = 6;    /* hlen */
+            reply[19] = 4;    /* plen */
+            reply[20] = 0x00; reply[21] = 0x02; /* oper = reply */
+            memcpy(&reply[22], peer_mac, 6);     /* sha = peer MAC */
+            memcpy(&reply[28], &pkt[38], 4);     /* spa = target IP (what was requested) */
+            memcpy(&reply[32], &pkt[6], 6);      /* tha = sender MAC (original requester) */
+            memcpy(&reply[38], &pkt[28], 4);     /* tpa = sender IP */
+
+            fprintf(stderr, "ice-mp: Loopback ARP reply port=%u "
+                    "requested=%u.%u.%u.%u\n",
+                    port_id, pkt[38], pkt[39], pkt[40], pkt[41]);
+            ice_mp_rx_enqueue(s, port_id, reply, 42);
+        }
+    }
+    /* Handle ICMP echo requests (IPv4 only) */
+    else if (ethertype == 0x0800 && len >= 34) {
+        uint8_t ihl = (pkt[14] & 0x0F) * 4;
+        uint8_t proto = pkt[23];
+        size_t icmp_off = 14 + ihl;
+
+        if (proto == 1 && len >= icmp_off + 8) {  /* ICMP */
+            uint8_t icmp_type = pkt[icmp_off];
+            if (icmp_type == 8) {  /* Echo Request */
+                uint8_t *reply = g_malloc(len);
+                memcpy(reply, pkt, len);
+                uint8_t peer_mac[6] = {0x52, 0x54, 0x00, 0xee, 0xff, port_id};
+
+                /* Swap Ethernet MACs */
+                memcpy(&reply[0], &pkt[6], 6);
+                memcpy(&reply[6], peer_mac, 6);
+
+                /* Swap IP src/dst */
+                memcpy(&reply[26], &pkt[30], 4); /* dst IP = orig src */
+                memcpy(&reply[30], &pkt[26], 4); /* src IP = orig dst */
+
+                /* Set TTL */
+                reply[22] = 64;
+
+                /* Recalculate IP header checksum */
+                reply[24] = 0; reply[25] = 0;
+                uint32_t ip_sum = 0;
+                for (int i = 14; i < 14 + ihl; i += 2) {
+                    ip_sum += (reply[i] << 8) | reply[i + 1];
+                }
+                while (ip_sum >> 16) {
+                    ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
+                }
+                uint16_t ip_cksum = ~ip_sum & 0xFFFF;
+                reply[24] = ip_cksum >> 8;
+                reply[25] = ip_cksum & 0xFF;
+
+                /* ICMP: type=0 (Echo Reply), recalculate checksum */
+                reply[icmp_off] = 0;  /* type = echo reply */
+                reply[icmp_off + 2] = 0; reply[icmp_off + 3] = 0; /* clear cksum */
+                uint32_t icmp_sum = 0;
+                size_t icmp_len = len - icmp_off;
+                for (size_t i = 0; i < icmp_len; i += 2) {
+                    uint16_t word = reply[icmp_off + i] << 8;
+                    if (i + 1 < icmp_len) {
+                        word |= reply[icmp_off + i + 1];
+                    }
+                    icmp_sum += word;
+                }
+                while (icmp_sum >> 16) {
+                    icmp_sum = (icmp_sum & 0xFFFF) + (icmp_sum >> 16);
+                }
+                uint16_t icmp_cksum = ~icmp_sum & 0xFFFF;
+                reply[icmp_off + 2] = icmp_cksum >> 8;
+                reply[icmp_off + 3] = icmp_cksum & 0xFF;
+
+                fprintf(stderr, "ice-mp: Loopback ICMP echo reply port=%u len=%zu\n",
+                        port_id, len);
+                ice_mp_rx_enqueue(s, port_id, reply, len);
+                g_free(reply);
+            }
+        }
+    }
+}
+
+static uint16_t ice_mp_tx_desc_buf_len(uint64_t qw1)
+{
+    return (uint16_t)((qw1 >> ICE_MP_TXD_QW1_TX_BUF_SZ_S) & 0x3FFF);
+}
+
+static uint16_t ice_mp_queue_size(const ICEMPQueue *q)
+{
+    /* If qlen is 0 but the queue is configured/enabled, use default size.
+     * The Linux ICE driver may not populate qlen in the AdminQ TX context,
+     * relying on other configuration mechanisms instead.
+     */
+    if (q->qlen == 0 && (q->configured || q->enabled)) {
+        return 256;  /* ICE_DFLT_NUM_TX_DESC */
+    }
+    return q->qlen ? q->qlen : 0;
+}
+
+static void ice_mp_tx_process_queue(struct ICEMPState *s, uint16_t qid)
+{
+    if (qid >= ICE_MP_MAX_TX_QUEUES) {
+        return;
+    }
+
+    ICEMPQueue *q = &s->txq[qid];
+    uint16_t ring_size = ice_mp_queue_size(q);
+    uint16_t head = q->head;
+    uint16_t tail = q->tail;
+
+    if (!q->configured || ring_size == 0 || head == tail) {
+        fprintf(stderr, "ice-mp: TX early return qid=%u conf=%d size=%u head=%u tail=%u\n",
+                qid, q->configured, ring_size, head, tail);
+        return;
+    }
+
+    if (!q->enabled) {
+        fprintf(stderr, "ice-mp: TX queue %u not enabled (conf=%d size=%u head=%u tail=%u)\n",
+                qid, q->configured, ring_size, head, tail);
+        return;
+    }
+
+    fprintf(stderr, "ice-mp: TX processing qid=%u head=%u tail=%u size=%u\n",
+            qid, head, tail, ring_size);
+
+    GByteArray *pkt = g_byte_array_new();
+
+    while (head != tail) {
+        uint64_t desc_addr = q->base + ((uint64_t)head * ICE_MP_TX_DESC_SIZE);
+        struct ice_mp_tx_desc desc;
+        uint64_t qw1;
+        uint16_t cmd;
+
+        pci_dma_read(&s->parent_obj, desc_addr, &desc, sizeof(desc));
+        qw1 = le64_to_cpu(desc.cmd_type_offset_bsz);
+        cmd = (qw1 >> ICE_MP_TXD_QW1_CMD_S) & 0xFFF;
+
+        uint8_t dtype = qw1 & 0xFULL;
+        fprintf(stderr, "ice-mp: TX desc qid=%u head=%u base=0x%lx desc_addr=0x%lx dtype=0x%x cmd=0x%x qw1=0x%lx\n",
+                qid, head, q->base, desc_addr, dtype, cmd, qw1);
+
+        if ((qw1 & 0xFULL) == ICE_TX_DESC_DTYPE_CTX) {
+            head = (head + 1) % ring_size;
+            continue;
+        }
+
+        if ((qw1 & 0xFULL) == ICE_TX_DESC_DTYPE_DATA) {
+            uint16_t len = ice_mp_tx_desc_buf_len(qw1);
+
+            if (len) {
+                uint8_t *buf = g_malloc(len);
+                pci_dma_read(&s->parent_obj, le64_to_cpu(desc.buf_addr), buf, len);
+                g_byte_array_append(pkt, buf, len);
+                g_free(buf);
+            }
+
+            if (cmd & ICE_TX_DESC_CMD_EOP) {
+                if (pkt->len && s->nic[q->port_id]) {
+                    NetClientState *nc = qemu_get_queue(s->nic[q->port_id]);
+                    fprintf(stderr, "ice-mp: Sending packet qid=%u port=%u len=%u\n",
+                            qid, q->port_id, pkt->len);
+                    qemu_send_packet(nc, pkt->data, pkt->len);
+                    /* Generate loopback ARP/ICMP responses for datapath */
+                    ice_mp_tx_loopback(s, q->port_id, pkt->data, pkt->len);
+                } else {
+                    fprintf(stderr, "ice-mp: Skipping packet qid=%u port=%u pkt_len=%u nic=%p\n",
+                            qid, q->port_id, pkt->len, s->nic[q->port_id]);
+                }
+
+                desc.cmd_type_offset_bsz =
+                    cpu_to_le64((qw1 & ~0xFULL) | ICE_TX_DESC_DTYPE_DESC_DONE);
+                /* Write only the 8-byte cmd_type_offset_bsz at offset +8
+                 * to avoid overwriting buf_addr unnecessarily */
+                uint64_t wb_addr = desc_addr + offsetof(struct ice_mp_tx_desc, cmd_type_offset_bsz);
+                pci_dma_write(&s->parent_obj, wb_addr,
+                              &desc.cmd_type_offset_bsz, sizeof(desc.cmd_type_offset_bsz));
+
+                /* Readback verification */
+                uint64_t readback = 0;
+                pci_dma_read(&s->parent_obj, wb_addr, &readback, sizeof(readback));
+                fprintf(stderr, "ice-mp: DD writeback qid=%u head=%u desc_addr=0x%lx "
+                        "wb_addr=0x%lx written=0x%lx readback=0x%lx match=%d\n",
+                        qid, head, (unsigned long)desc_addr, (unsigned long)wb_addr,
+                        (unsigned long)le64_to_cpu(desc.cmd_type_offset_bsz),
+                        (unsigned long)le64_to_cpu(readback),
+                        (desc.cmd_type_offset_bsz == readback));
+
+                bool msix_on = msix_enabled(&s->parent_obj);
+                bool cause_ena = !!(q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M);
+                uint16_t msix_idx = q->int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+                
+                if (msix_on && cause_ena && msix_idx < ICE_MP_MSIX_VECTORS) {
+                    bool masked = msix_is_masked(&s->parent_obj, msix_idx);
+
+                    fprintf(stderr,
+                            "ice-mp: TX IRQ qid=%u vec=%u masked=%d\n",
+                            qid, msix_idx, masked);
+                    msix_notify(&s->parent_obj, msix_idx);
+                }
+
+                g_byte_array_set_size(pkt, 0);
+            }
+        }
+
+        head = (head + 1) % ring_size;
+    }
+
+    q->head = head;
+    g_byte_array_free(pkt, true);
+}
+
+static uint32_t ice_mp_rx_buf_len(const uint32_t *ctx)
+{
+    uint64_t dbuf = ice_mp_extract_bits(ctx, 102, 7);
+    if (!dbuf) {
+        return 0;
+    }
+
+    return (uint32_t)(dbuf << 7);
+}
+
+static bool ice_mp_rx_enqueue_queue(struct ICEMPState *s, uint16_t qid,
+                                    const uint8_t *buf, size_t size)
+{
+    if (qid >= ICE_MP_MAX_RX_QUEUES) {
+        return false;
+    }
+
+    ICEMPQueue *q = &s->rxq[qid];
+    uint16_t ring_size = ice_mp_queue_size(q);
+    size_t remaining = size;
+    const uint8_t *cursor = buf;
+
+    if (!q->configured || !q->enabled || ring_size == 0 || q->head == q->tail) {
+        return false;
+    }
+
+    while (q->head != q->tail && remaining) {
+        uint64_t desc_addr = q->base + ((uint64_t)q->head * ICE_MP_RX_DESC_SIZE);
+        union ice_mp_rx_desc desc;
+        uint32_t copy_len;
+        uint32_t buf_len = ice_mp_rx_buf_len(s->rx_ctx[qid]);
+
+        pci_dma_read(&s->parent_obj, desc_addr, &desc, sizeof(desc));
+
+        if (!desc.read.pkt_addr || !buf_len) {
+            return false;
+        }
+
+        copy_len = (remaining > buf_len) ? buf_len : (uint32_t)remaining;
+        pci_dma_write(&s->parent_obj, le64_to_cpu(desc.read.pkt_addr),
+                      cursor, copy_len);
+
+        memset(&desc, 0, sizeof(desc));
+        desc.wb.rxdid = ICE_RXDID_FLEX_NIC;
+        desc.wb.pkt_len = cpu_to_le16(copy_len);
+        desc.wb.status_error0 = cpu_to_le16(ICE_MP_RX_STATUS0_DD |
+                                            (remaining > buf_len ? 0 : ICE_MP_RX_STATUS0_EOF));
+
+        pci_dma_write(&s->parent_obj, desc_addr, &desc, sizeof(desc));
+
+        q->head = (q->head + 1) % ring_size;
+        cursor += copy_len;
+        remaining -= copy_len;
+
+        if (msix_enabled(&s->parent_obj) && (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M)) {
+            uint16_t msix_idx = q->int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+            
+            if (msix_idx < ICE_MP_MSIX_VECTORS) {
+                bool masked = msix_is_masked(&s->parent_obj, msix_idx);
+
+                fprintf(stderr,
+                        "ice-mp: RX IRQ qid=%u vec=%u masked=%d\n",
+                        qid, msix_idx, masked);
+                msix_notify(&s->parent_obj, msix_idx);
+            }
+        }
+    }
+
+    return remaining == 0;
+}
+
+static bool ice_mp_rx_enqueue(struct ICEMPState *s, uint8_t port_id,
+                              const uint8_t *buf, size_t size)
+{
+    for (uint16_t qid = 0; qid < ICE_MP_MAX_RX_QUEUES; qid++) {
+        ICEMPQueue *q = &s->rxq[qid];
+        if (!q->configured || !q->enabled || q->port_id != port_id) {
+            continue;
+        }
+
+        if (ice_mp_rx_enqueue_queue(s, qid, buf, size)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool ice_mp_can_receive(NetClientState *nc)
+{
+    ICEMPPort *port = qemu_get_nic_opaque(nc);
+    ICEMPState *s = port->s;
+
+    for (uint16_t qid = 0; qid < ICE_MP_MAX_RX_QUEUES; qid++) {
+        ICEMPQueue *q = &s->rxq[qid];
+        if (!q->configured || !q->enabled || q->port_id != port->port_id) {
+            continue;
+        }
+        if (q->head != q->tail) {
+            return true;
+        }
+    }
+
+    /* Debug: log when can_receive returns false for a port that has queues */
+    static uint32_t can_recv_debug_count = 0;
+    if (can_recv_debug_count < 20) {
+        bool has_queues = false;
+        for (uint16_t qid = 0; qid < ICE_MP_MAX_RX_QUEUES; qid++) {
+            ICEMPQueue *q = &s->rxq[qid];
+            if (q->configured || q->enabled) {
+                if (!has_queues) {
+                    fprintf(stderr, "ice-mp: can_receive port=%u returning false. RX queues:\n", port->port_id);
+                    has_queues = true;
+                }
+                fprintf(stderr, "  qid=%u configured=%d enabled=%d port_id=%u head=%u tail=%u base=0x%lx qlen=%u\n",
+                        qid, q->configured, q->enabled, q->port_id, q->head, q->tail, q->base, q->qlen);
+            }
+        }
+        if (has_queues) can_recv_debug_count++;
+    }
+
+    return false;
+}
+
+static ssize_t ice_mp_receive(NetClientState *nc, const uint8_t *buf, size_t size)
+{
+    ICEMPPort *port = qemu_get_nic_opaque(nc);
+    ICEMPState *s = port->s;
+    uint16_t vf_id;
+
+    fprintf(stderr, "ice-mp: receive called port=%u size=%zu\n", port->port_id, size);
+
+    vf_id = ice_mp_select_vf(s, port->port_id, buf, size);
+    if (vf_id < s->num_vfs && s->vf_rxq_mapena[vf_id] && s->vf_rxq_num[vf_id]) {
+        uint16_t base = s->vf_rxq_base[vf_id];
+        uint16_t count = s->vf_rxq_num[vf_id];
+        uint16_t qid = base + (buf[ICE_MP_ETH_DA_OFFSET] % count);
+
+        if (ice_mp_rx_enqueue_queue(s, qid, buf, size)) {
+            return size;
+        }
+    }
+
+    if (ice_mp_rx_enqueue(s, port->port_id, buf, size)) {
+        return size;
+    }
+
+    return 0;
+}
+
+static void ice_mp_link_status_changed(NetClientState *nc)
+{
+    ICEMPPort *port = qemu_get_nic_opaque(nc);
+    ICEMPState *s = port->s;
+    uint8_t port_id = port->port_id;
+    bool link_up = !nc->link_down;
+
+    if (port_id >= s->num_ports) {
+        return;
+    }
+
+    fprintf(stderr, "ice-mp: link_status_changed port=%u link_up=%d\n",
+            port_id, link_up);
+
+    if (link_up) {
+        s->port_status[port_id] = ICE_MP_PORT_LINK_UP |
+                                   (ICE_MP_SPEED_100G << ICE_MP_PORT_SPEED_SHIFT);
+    } else {
+        s->port_status[port_id] = (ICE_MP_SPEED_100G << ICE_MP_PORT_SPEED_SHIFT);
+    }
+
+    /* Fire link change event interrupt if MSI-X is enabled */
+    if (msix_enabled(&s->parent_obj)) {
+        s->event_doorbell = (ICE_MP_EVENT_LINK_CHANGE << 8) | port_id;
+        if (msix_enabled(&s->parent_obj) &&
+            !msix_is_masked(&s->parent_obj, 0)) {
+            msix_notify(&s->parent_obj, 0);
+        }
+    }
+}
+
+static NetClientInfo net_ice_mp_info = {
+    .type = NET_CLIENT_DRIVER_NIC,
+    .size = sizeof(NetClientState),
+    .receive = ice_mp_receive,
+    .can_receive = ice_mp_can_receive,
+    .link_status_changed = ice_mp_link_status_changed,
+};
+
+static bool ice_mp_mac_is_zero(const MACAddr *mac)
+{
+    for (size_t i = 0; i < sizeof(mac->a); i++) {
+        if (mac->a[i] != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void ice_mp_init_nics(ICEMPState *s, PCIDevice *pdev)
+{
+    DeviceState *dev = DEVICE(pdev);
+
+    for (uint32_t i = 0; i < s->num_ports; i++) {
+        char *name;
+
+        s->ports[i].s = s;
+        s->ports[i].port_id = (uint8_t)i;
+
+        if (i == 0) {
+            qemu_macaddr_default_if_unset(&s->conf[i].macaddr);
+        } else if (ice_mp_mac_is_zero(&s->conf[i].macaddr)) {
+            s->conf[i].macaddr = s->conf[0].macaddr;
+            s->conf[i].macaddr.a[5] += (uint8_t)i;
+        }
+
+        name = g_strdup_printf("%s-port%u", dev->id ? dev->id : "ice-mp", i);
+        s->nic[i] = qemu_new_nic(&net_ice_mp_info, &s->conf[i],
+                                object_get_typename(OBJECT(s)), name,
+                                &dev->mem_reentrancy_guard, &s->ports[i]);
+        g_free(name);
+
+        qemu_format_nic_info_str(qemu_get_queue(s->nic[i]),
+                                 s->conf[i].macaddr.a);
+    }
 }
 
 static uint16_t ice_mp_nvm_shadow_word(uint16_t word)
@@ -540,6 +1567,222 @@ static void ice_mp_adminq_nvm_read(struct ICEMPState *s, struct ice_mp_aq_desc *
     ice_mp_adminq_complete(s, desc);
 }
 
+static void ice_mp_adminq_add_tx_queues(struct ICEMPState *s,
+                                        struct ice_mp_aq_desc *desc)
+{
+    /* Parse the Add Tx LAN Queues command buffer */
+    /* 0x0C30 uses addr_high at params[8] and addr_low at params[12] */
+    uint64_t addr = ice_mp_dma_addr(le32_to_cpu(*(uint32_t *)&desc->params[12]),
+                                    le32_to_cpu(*(uint32_t *)&desc->params[8]));
+    uint16_t buf_len = le16_to_cpu(desc->datalen);
+    uint8_t *buf;
+    uint32_t parent_teid;
+    uint8_t num_txqs;
+
+    /* Ensure command returns success unless explicitly set otherwise */
+    desc->retval = cpu_to_le16(0);
+
+    if (!addr || !buf_len) {
+        fprintf(stderr, "ice-mp: Add Tx Queues - no buffer provided\n");
+        ice_mp_adminq_complete(s, desc);
+        return;
+    }
+
+    /* Read the command buffer */
+    buf = g_malloc(buf_len);
+    pci_dma_read(&s->parent_obj, addr, buf, buf_len);
+
+    /* Parse ice_aqc_add_tx_qgrp structure:
+     *   parent_teid: 4 bytes
+     *   num_txqs: 1 byte
+     *   rsvd: 3 bytes
+     *   txqs[]: array of ice_aqc_add_txqs_perq structures
+     */
+    memcpy(&parent_teid, buf, 4);
+    parent_teid = le32_to_cpu(parent_teid);
+    num_txqs = buf[4];
+
+    fprintf(stderr, "ice-mp: Add Tx Queues - num_txqs=%u parent_teid=0x%x\n",
+            num_txqs, parent_teid);
+
+    /* Process each queue in the list */
+    for (int i = 0; i < num_txqs; i++) {
+        /* Each ice_aqc_add_txqs_perq entry:
+         *   txq_id: 2 bytes (offset 8 + i*48)
+         *   rsvd: 2 bytes
+         *   q_teid: 4 bytes
+         *   txq_ctx: 22 bytes  ← TX CONTEXT WITH BASE AND QLEN!
+         *   rsvd2: 2 bytes
+         *   info (ice_aqc_txsched_elem): 16 bytes
+         * Total size: 48 bytes per queue
+         */
+        size_t offset = 8 + (i * 48);
+        if (offset + 48 > buf_len) {
+            fprintf(stderr, "ice-mp: Add Tx Queues - buffer too small for queue %d\n", i);
+            break;
+        }
+
+        uint16_t txq_id;
+        memcpy(&txq_id, buf + offset, 2);
+        txq_id = le16_to_cpu(txq_id);
+
+        if (txq_id < ICE_MP_MAX_TX_QUEUES) {
+            /* Parse the 22-byte TX context to get base address, qlen, and port */
+            const uint8_t *txq_ctx = buf + offset + 8;  /* Skip txq_id(2) + rsvd(2) + q_teid(4) */
+            
+            /* Debug: dump the raw 22-byte context */
+            fprintf(stderr, "ice-mp: TX ctx raw bytes for qid=%u: ", txq_id);
+            for (int j = 0; j < 22; j++) {
+                fprintf(stderr, "%02x ", txq_ctx[j]);
+            }
+            fprintf(stderr, "\n");
+            
+            /* Treat the 22-byte context as an array of 32-bit words for bit extraction
+             * The context fields are:
+             *   base: 57 bits at bit 0
+             *   port_num: 3 bits at bit 57
+             *   src_vsi: 10 bits at bit 80
+             *   qlen: 13 bits at bit 135
+             */
+            uint32_t ctx_words[6];  /* 22 bytes = 5.5 words, round up to 6 */
+            memset(ctx_words, 0, sizeof(ctx_words));
+            memcpy(ctx_words, txq_ctx, 22);
+            
+            /* Convert to little endian */
+            for (int j = 0; j < 6; j++) {
+                ctx_words[j] = le32_to_cpu(ctx_words[j]);
+            }
+            
+            /* Extract fields using bit extraction */
+            uint64_t base = ice_mp_extract_bits(ctx_words, 0, 57);
+            uint64_t port_num = ice_mp_extract_bits(ctx_words, 57, 3);
+            uint64_t src_vsi = ice_mp_extract_bits(ctx_words, 80, 10);
+            uint64_t qlen = ice_mp_extract_bits(ctx_words, 135, 13);
+            
+            /* Configure the queue */
+            s->txq[txq_id].base = base << 7;  /* Base is in units of 128 bytes */
+            s->txq[txq_id].qlen = qlen ? (uint16_t)qlen : 0;
+
+            /* Determine port: prefer src_vsi lookup, fallback to port_num */
+            if (src_vsi > 0 && src_vsi < ICE_MP_MAX_VSI) {
+                s->txq[txq_id].port_id = s->vsi_to_port[src_vsi];
+            } else if (port_num > 0) {
+                s->txq[txq_id].port_id = (uint8_t)(port_num % s->num_ports);
+            } else {
+                s->txq[txq_id].port_id = 0;
+            }
+
+            /* Reset head/tail on queue reconfiguration */
+            s->txq[txq_id].head = 0;
+            s->txq[txq_id].tail = 0;
+            /* Mark as configured if base address is valid, even if qlen=0 */
+            s->txq[txq_id].configured = (base != 0);
+            s->txq[txq_id].enabled = true;
+            
+            fprintf(stderr, "ice-mp: Enabling TX queue %u: base=0x%lx qlen=%lu port=%u src_vsi=%lu configured=%d\n",
+                    txq_id, s->txq[txq_id].base, qlen, s->txq[txq_id].port_id, src_vsi, s->txq[txq_id].configured);
+
+            /* Propagate port change to RX queues sharing same MSI-X vector */
+            if (s->txq[txq_id].configured) {
+                uint16_t tx_msix = s->txq[txq_id].int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+                for (uint16_t rxq = 0; rxq < ICE_MP_MAX_RX_QUEUES; rxq++) {
+                    uint16_t rx_msix = s->rxq[rxq].int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+                    if (rx_msix == tx_msix && rx_msix != 0) {
+                        if (s->rxq[rxq].port_id != s->txq[txq_id].port_id) {
+                            fprintf(stderr, "ice-mp: Syncing RX qid=%u port %u -> %u (TX qid=%u msix=%u)\n",
+                                    rxq, s->rxq[rxq].port_id, s->txq[txq_id].port_id, txq_id, tx_msix);
+                            s->rxq[rxq].port_id = s->txq[txq_id].port_id;
+                        }
+                    }
+                }
+            }
+
+            /* Allocate a TEID for the queue and write it back */
+            uint32_t q_teid = cpu_to_le32(s->next_sched_teid++);
+            memcpy(buf + offset + 4, &q_teid, 4);
+        } else {
+            fprintf(stderr, "ice-mp: Warning - TX queue ID %u out of range\n", txq_id);
+        }
+    }
+
+    /* Write the buffer back with assigned TEIDs */
+    pci_dma_write(&s->parent_obj, addr, buf, buf_len);
+    g_free(buf);
+
+    ice_mp_adminq_complete(s, desc);
+}
+
+static void ice_mp_adminq_sw_rules(struct ICEMPState *s,
+                                   struct ice_mp_aq_desc *desc,
+                                   uint16_t opcode)
+{
+    uint16_t rule_count = le16_to_cpu(*(uint16_t *)&desc->params[0]);
+    uint64_t addr = ice_mp_dma_addr(le32_to_cpu(*(uint32_t *)&desc->params[12]),
+                                    le32_to_cpu(*(uint32_t *)&desc->params[8]));
+    uint16_t buf_len = le16_to_cpu(desc->datalen);
+    uint8_t *buf;
+    size_t offset = 0;
+
+    if (!addr || !rule_count || !buf_len) {
+        ice_mp_adminq_complete(s, desc);
+        return;
+    }
+
+    buf = g_malloc0(buf_len);
+    pci_dma_read(&s->parent_obj, addr, buf, buf_len);
+
+    for (uint16_t i = 0; i < rule_count && offset < buf_len; i++) {
+        size_t elem_len = ice_mp_sw_rule_elem_size(buf + offset, buf_len - offset);
+        uint16_t type;
+
+        if (!elem_len || offset + elem_len > buf_len) {
+            break;
+        }
+
+        type = ice_mp_read_le16(buf + offset);
+
+        if (type == ICE_MP_SW_RULE_T_LKUP_RX || type == ICE_MP_SW_RULE_T_LKUP_TX) {
+            struct ice_mp_sw_rule_lkup_rx_tx_fixed fixed;
+            uint16_t rule_id;
+            uint16_t status = 0;
+
+            memcpy(&fixed, buf + offset, sizeof(fixed));
+
+            rule_id = le16_to_cpu(fixed.index);
+            if (opcode == 0x02A0 && rule_id == 0) {
+                rule_id = s->next_rule_id++;
+            }
+
+            if (opcode == 0x02A2) {
+                IceMpRxRule *rule = ice_mp_rule_find_by_id(s, rule_id);
+                if (rule) {
+                    rule->valid = false;
+                }
+            } else if (type == ICE_MP_SW_RULE_T_LKUP_RX) {
+                const uint8_t *hdr_data = buf + offset + sizeof(fixed);
+                size_t hdr_len = elem_len - sizeof(fixed);
+                ice_mp_sw_rule_program(s, rule_id, &fixed, hdr_data, hdr_len);
+            }
+
+            memcpy(buf + offset + offsetof(struct ice_mp_sw_rule_lkup_rx_tx_fixed, index),
+                   &((uint16_t){cpu_to_le16(rule_id)}), sizeof(uint16_t));
+            memcpy(buf + offset + offsetof(struct ice_mp_sw_rule_hdr, status),
+                   &((uint16_t){cpu_to_le16(status)}), sizeof(uint16_t));
+        } else if (type == ICE_MP_SW_RULE_T_LG_ACT || type == ICE_MP_SW_RULE_T_VSI_LIST) {
+            uint16_t status = 0;
+            memcpy(buf + offset + offsetof(struct ice_mp_sw_rule_hdr, status),
+                   &((uint16_t){cpu_to_le16(status)}), sizeof(uint16_t));
+        }
+
+        offset += elem_len;
+    }
+
+    pci_dma_write(&s->parent_obj, addr, buf, buf_len);
+    g_free(buf);
+
+    ice_mp_adminq_complete(s, desc);
+}
+
 static void ice_mp_adminq_complete(struct ICEMPState *s, struct ice_mp_aq_desc *desc)
 {
     uint16_t opcode = le16_to_cpu(desc->opcode);
@@ -555,13 +1798,91 @@ static void ice_mp_adminq_complete(struct ICEMPState *s, struct ice_mp_aq_desc *
                 le16_to_cpu(desc->flags), le16_to_cpu(desc->retval));
     }
     
-    desc->flags |= cpu_to_le16(ICE_MP_AQ_FLAG_DD | ICE_MP_AQ_FLAG_CMP);
+    /* Clear any stale error bits and return only DD/CMP (+BUF if present). */
+    desc->flags = cpu_to_le16((le16_to_cpu(desc->flags) & ICE_MP_AQ_FLAG_BUF) |
+                              ICE_MP_AQ_FLAG_DD | ICE_MP_AQ_FLAG_CMP);
     
     /* Debug for 0x0401 */
     if (opcode == 0x0401) {
         fprintf(stderr, "ice-mp: complete() AFTER flags: flags=0x%04x retval=0x%04x\n",
                 le16_to_cpu(desc->flags), le16_to_cpu(desc->retval));
     }
+}
+
+/* Get PHY Capabilities (indirect 0x0600) */
+static void ice_mp_adminq_get_phy_caps(struct ICEMPState *s, struct ice_mp_aq_desc *desc)
+{
+    /*
+     * Return PHY capabilities matching ice_aqc_get_phy_caps_data layout.
+     * The driver uses this to discover supported PHY types and link modes.
+     * Without proper data, the driver may not attempt to bring the link up.
+     */
+    struct {
+        uint64_t phy_type_low;     /* offset 0 */
+        uint64_t phy_type_high;    /* offset 8 */
+        uint8_t caps;              /* offset 16 */
+        uint8_t low_power_ctrl_an; /* offset 17 */
+        uint16_t eee_cap;          /* offset 18 */
+        uint16_t eeer_value;       /* offset 20 */
+        uint8_t phy_id_oui[4];    /* offset 22 */
+        uint8_t phy_fw_ver[8];    /* offset 26 */
+        uint8_t link_fec_options;  /* offset 34 */
+        uint8_t module_compliance_enforcement; /* offset 35 */
+        uint8_t extended_compliance_code;      /* offset 36 */
+        uint8_t module_type[3];    /* offset 37 */
+    } __attribute__((packed)) pcaps;
+
+    uint64_t addr;
+    uint8_t port_num = desc->params[0] & 0xFF;
+
+    if (port_num >= s->num_ports) {
+        port_num = 0;
+    }
+
+    memset(&pcaps, 0, sizeof(pcaps));
+
+    /* 100GBASE-CR4 = bit 10 in phy_type_low */
+    pcaps.phy_type_low = cpu_to_le64(
+        (1ULL << 10) |  /* ICE_PHY_TYPE_LOW_100GBASE_CR4 */
+        (1ULL << 11) |  /* ICE_PHY_TYPE_LOW_100GBASE_SR4 */
+        (1ULL << 12)    /* ICE_PHY_TYPE_LOW_100GBASE_LR4 */
+    );
+    pcaps.phy_type_high = 0;
+
+    /* caps: EN_LINK (bit 3) must be set for the driver to consider link capable */
+    pcaps.caps = (1 << 3) |  /* ICE_AQC_PHY_EN_LINK */
+                 (1 << 0) |  /* ICE_AQC_PHY_EN_TX_LINK_PAUSE */
+                 (1 << 1);   /* ICE_AQC_PHY_EN_RX_LINK_PAUSE */
+
+    pcaps.low_power_ctrl_an = 0;
+    pcaps.eee_cap = 0;
+    pcaps.eeer_value = 0;
+
+    /* FEC options */
+    pcaps.link_fec_options = (1 << 6);  /* ICE_AQC_PHY_FEC_25G_RS_CLAUSE91_EN */
+
+    /* Module type - QSFP28 */
+    pcaps.module_type[0] = 0x03;  /* SFF_8636 module */
+
+    /* Write PHY caps to DMA buffer.
+     * The driver passes addr via desc params: addr_high at params[2], addr_low at params[3].
+     */
+    addr = ((uint64_t)le32_to_cpu(*(uint32_t *)&desc->params[8]) << 32) |
+            le32_to_cpu(*(uint32_t *)&desc->params[12]);
+
+    if (addr) {
+        /* Write what we have. The driver buffer (ice_aqc_get_phy_caps_data)
+         * may be larger but zeros are fine for the rest since we memset 0. */
+        pci_dma_write(PCI_DEVICE(s), addr, &pcaps, sizeof(pcaps));
+        fprintf(stderr, "ice-mp: GET_PHY_CAPS port=%u: wrote %zu bytes to DMA 0x%lx "
+                "(phy_type_low=0x%lx caps=0x%x)\n",
+                port_num, sizeof(pcaps), (unsigned long)addr,
+                (unsigned long)le64_to_cpu(pcaps.phy_type_low), pcaps.caps);
+    } else {
+        fprintf(stderr, "ice-mp: GET_PHY_CAPS port=%u: no DMA addr!\n", port_num);
+    }
+
+    ice_mp_adminq_complete(s, desc);
 }
 
 /* Set PHY Config (indirect 0x0601) - Handle link up/down */
@@ -631,12 +1952,22 @@ static void ice_mp_adminq_update_vsi(struct ICEMPState *s, struct ice_mp_aq_desc
 {
     uint64_t addr = ice_mp_dma_addr(le32_to_cpu(*(uint32_t *)&desc->params[12]),
                                     le32_to_cpu(*(uint32_t *)&desc->params[8]));
+    uint16_t vsi_num = le16_to_cpu(*(uint16_t *)&desc->params[0]);
+    uint8_t vf_id = desc->params[4];
     
     if (addr) {
         /* Read VSI context from buffer and write it back */
         uint8_t vsi_ctx[128];  /* ice_aqc_vsi_props structure */
         pci_dma_read(&s->parent_obj, addr, vsi_ctx, sizeof(vsi_ctx));
         pci_dma_write(&s->parent_obj, addr, vsi_ctx, sizeof(vsi_ctx));
+    }
+
+    if (vsi_num < ICE_MP_MAX_VSI) {
+        if (vf_id < s->num_vfs) {
+            s->vsi_to_vf[vsi_num] = vf_id;
+        } else {
+            s->vsi_to_vf[vsi_num] = 0xFFFF;
+        }
     }
     
     /* Response ext_status = 0 */
@@ -663,6 +1994,28 @@ static void ice_mp_adminq_get_vsi(struct ICEMPState *s, struct ice_mp_aq_desc *d
 /* Free VSI (0x0213) */
 static void ice_mp_adminq_free_vsi(struct ICEMPState *s, struct ice_mp_aq_desc *desc)
 {
+    uint16_t vsi_num = le16_to_cpu(*(uint16_t *)&desc->params[0]);
+
+    fprintf(stderr, "ice-mp: Free VSI (0x0213) vsi_num=%u\n", vsi_num);
+
+    if (vsi_num < ICE_MP_MAX_VSI) {
+        /* If this was a PF-type VSI, decrement the PF VSI count.
+         * When all PF VSIs are freed (rebuild cycle), reset the counter
+         * so the next Add VSI cycle assigns ports correctly.
+         */
+        if (s->vsi_to_vf[vsi_num] == 0xFFFF) {
+            /* This was a PF-type VSI */
+            if (s->pf_vsi_count > 0) {
+                s->pf_vsi_count--;
+            }
+            if (s->pf_vsi_count == 0) {
+                fprintf(stderr, "ice-mp: All PF VSIs freed, resetting pf_vsi_count\n");
+            }
+        }
+        s->vsi_to_vf[vsi_num] = 0xFFFF;
+        s->vsi_to_port[vsi_num] = 0;
+    }
+
     /* Just acknowledge the free request */
     ice_mp_adminq_complete(s, desc);
 }
@@ -670,19 +2023,20 @@ static void ice_mp_adminq_free_vsi(struct ICEMPState *s, struct ice_mp_aq_desc *
 /* Get Link Status (indirect 0x0607) */
 static void ice_mp_adminq_get_link_status(struct ICEMPState *s, struct ice_mp_aq_desc *desc)
 {
+    /* Match Linux driver struct ice_aqc_get_link_status_data layout exactly */
     struct {
         uint8_t topo_media_conflict;
         uint8_t link_cfg_err;
-        uint8_t link_info;
+        uint8_t link_info;            /* Byte 2: Bit 0 = ICE_AQ_LINK_UP */
         uint8_t an_info;
         uint8_t ext_info;
-        uint8_t loopback;
+        uint8_t reserved2;
         uint16_t max_frame_size;
         uint8_t cfg;
-        uint8_t pwr_desc;
+        uint8_t power_desc;
         uint16_t link_speed;
-        uint16_t reserved1;
-        uint8_t reserved2[2];
+        uint16_t reserved3;
+        uint8_t reserved4[2];
         uint64_t phy_type_low;
         uint64_t phy_type_high;
     } __attribute__((packed)) link_status = {0};
@@ -701,6 +2055,9 @@ static void ice_mp_adminq_get_link_status(struct ICEMPState *s, struct ice_mp_aq
     link_up = (port_status & ICE_MP_PORT_LINK_UP) != 0;
     speed = (port_status >> ICE_MP_PORT_SPEED_SHIFT) & 0x7;
     
+    fprintf(stderr, "ice-mp: Get Link Status lport_num=%u (clamped=%u): port_status=0x%x, link_up=%d, speed=%u\n",
+            desc->params[0], port_num, port_status, link_up, speed);
+    
     /* Populate link status from port state */
     link_status.topo_media_conflict = 0;
     link_status.link_cfg_err = 0;
@@ -711,12 +2068,12 @@ static void ice_mp_adminq_get_link_status(struct ICEMPState *s, struct ice_mp_aq
     /* Auto-negotiation - assume disabled for 100G */
     link_status.an_info = 0;
     link_status.ext_info = 0;
-    link_status.loopback = 0;
+    link_status.reserved2 = 0;
     link_status.max_frame_size = cpu_to_le16(9728);  /* Standard jumbo frame */
     
     /* Full duplex when link is up */
     link_status.cfg = link_up ? 0x01 : 0x00;  /* Bit 0 = full duplex */
-    link_status.pwr_desc = 0;
+    link_status.power_desc = 0;
     
     /* Link speed encoding: 100G = 0x800 */
     if (link_up) {
@@ -748,10 +2105,19 @@ static void ice_mp_adminq_get_link_status(struct ICEMPState *s, struct ice_mp_aq
     link_status.phy_type_high = 0;
     
     /* Write response to DMA buffer */
-    addr = ((uint64_t)le32_to_cpu(desc->params[2]) << 32) |
-           le32_to_cpu(desc->params[3]);
+    /* params layout: bytes 0-3=param0, 4-7=param1, 8-11=addr_high, 12-15=addr_low */
+    uint32_t addr_high, addr_low;
+    memcpy(&addr_high, &desc->params[8], 4);
+    memcpy(&addr_low, &desc->params[12], 4);
+    addr = ((uint64_t)le32_to_cpu(addr_high) << 32) | le32_to_cpu(addr_low);
     
     if (addr) {
+        fprintf(stderr, "ice-mp: Writing link_status to DMA addr 0x%lx, size=%zu\n", addr, sizeof(link_status));
+        fprintf(stderr, "ice-mp: link_status bytes: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                ((uint8_t*)&link_status)[0], ((uint8_t*)&link_status)[1],
+                ((uint8_t*)&link_status)[2], ((uint8_t*)&link_status)[3],
+                ((uint8_t*)&link_status)[4], ((uint8_t*)&link_status)[5],
+                ((uint8_t*)&link_status)[6], ((uint8_t*)&link_status)[7]);
         pci_dma_write(PCI_DEVICE(s), addr, &link_status, sizeof(link_status));
         desc->datalen = cpu_to_le16(sizeof(link_status));
     }
@@ -827,6 +2193,8 @@ static void ice_mp_adminq_list_caps(struct ICEMPState *s, struct ice_mp_aq_desc 
 
     memset(elems, 0, sizeof(elems));
 
+    fprintf(stderr, "ice-mp: ice_mp_adminq_list_caps() called, is_dev_caps=%d\n", is_dev_caps);
+
     /* VALID_FUNCTIONS */
     elems[count].cap = cpu_to_le16(0x0005);
     elems[count].number = cpu_to_le32(0x1);
@@ -846,6 +2214,8 @@ static void ice_mp_adminq_list_caps(struct ICEMPState *s, struct ice_mp_aq_desc 
     /* VSI */
     elems[count].cap = cpu_to_le16(0x0017);
     elems[count].number = cpu_to_le32(64);
+    fprintf(stderr, "ice-mp: Setting VSI capability - cap=0x%04x, number=%u (index %d)\n",
+            0x0017, 64, count);
     count++;
 
     /* RXQS */
@@ -1281,7 +2651,13 @@ static void ice_mp_adminq_delete_sched_elems(struct ICEMPState *s, struct ice_mp
             le32_to_cpu(buf_header->parent_teid), num_elems);
     
     for (i = 0; i < num_elems; i++) {
-        fprintf(stderr, "ice-mp:   Deleting TEID 0x%08x\n", le32_to_cpu(teids[i]));
+        uint32_t del_teid = le32_to_cpu(teids[i]);
+        fprintf(stderr, "ice-mp:   Deleting TEID 0x%08x\n", del_teid);
+        /* Clear from scheduler node table */
+        uint32_t idx = del_teid - ICE_MP_SCHED_TEID_BASE;
+        if (idx < ICE_MP_MAX_SCHED_NODES) {
+            s->sched_nodes[idx].valid = false;
+        }
     }
     
     /* Update response header */
@@ -1353,12 +2729,22 @@ static void ice_mp_adminq_add_sched_elems(struct ICEMPState *s, struct ice_mp_aq
     pci_dma_read(&s->parent_obj, addr + 8, buf + 8, num_elems * 24);
     elems = (void *)(buf + 8);
     
-    /* Generate TEIDs for each element */
+    /* Generate TEIDs for each element and track parentage */
     for (i = 0; i < num_elems; i++) {
-        elems[i].node_teid = cpu_to_le32(s->next_sched_teid++);
+        uint32_t new_teid = s->next_sched_teid++;
+        uint32_t parent = le32_to_cpu(elems[i].parent_teid);
+        elems[i].node_teid = cpu_to_le32(new_teid);
+
+        /* Track this node in the scheduler table */
+        uint32_t idx = new_teid - ICE_MP_SCHED_TEID_BASE;
+        if (idx < ICE_MP_MAX_SCHED_NODES) {
+            s->sched_nodes[idx].valid = true;
+            s->sched_nodes[idx].parent_teid = parent;
+            s->sched_nodes[idx].elem_type = elems[i].data.elem_type;
+        }
+
         fprintf(stderr, "ice-mp: Add Sched Elem: elem[%d] TEID=0x%x type=%d parent=0x%x\n",
-                i, s->next_sched_teid - 1, elems[i].data.elem_type,
-                le32_to_cpu(elems[i].parent_teid));
+                i, new_teid, elems[i].data.elem_type, parent);
         fprintf(stderr, "ice-mp:   elem structure: parent_teid=%08x node_teid=%08x elem_type=%d\n",
                 le32_to_cpu(elems[i].parent_teid),
                 le32_to_cpu(elems[i].node_teid),
@@ -1425,18 +2811,42 @@ static void ice_mp_adminq_set_port_params(struct ICEMPState *s, struct ice_mp_aq
 static void ice_mp_adminq_add_vsi(struct ICEMPState *s, struct ice_mp_aq_desc *desc)
 {
     /* Add VSI command indirect:
-     * Input: buffer with VSI parameters (ice_aqc_vsi_props structure)
+     * Input: 
+     *   - desc->params[0:1]: vsi_num (requested from driver, with ICE_AQ_VSI_IS_VALID bit)
+     *   - desc->params[4:5]: vf_id  
+     *   - desc->params[8-15]: DMA addr to VSI properties buffer
      * Output: VSI info in descriptor params (ice_aqc_add_update_free_vsi_resp)
      */
+    
+    /* Read the requested VSI number from request
+     * Driver sets: cmd->vsi_num = cpu_to_le16(vsi_ctx->vsi_num | ICE_AQ_VSI_IS_VALID)
+     * If ICE_AQ_VSI_IS_VALID is set, the driver requests a specific VSI number.
+     * Otherwise, the device should allocate one from the pool.
+     */
+    const uint16_t ICE_AQ_VSI_IS_VALID = 0x8000;
+    const uint16_t ICE_AQ_VSI_NUM_M = 0x03FF;
+    uint16_t raw_vsi_num = le16_to_cpu(*(uint16_t *)&desc->params[0]);
+    bool vsi_num_valid = (raw_vsi_num & ICE_AQ_VSI_IS_VALID) != 0;
+    uint16_t requested_vsi_num = raw_vsi_num & ICE_AQ_VSI_NUM_M;
+    uint8_t vf_id = desc->params[4];
+    /* vsi_flags is at params[6:7] per ice_aqc_add_get_update_free_vsi struct:
+     *   params[0:1] = vsi_num, params[2:3] = cmd_flags,
+     *   params[4] = vf_id (u8), params[5] = reserved,
+     *   params[6:7] = vsi_flags, params[8:15] = DMA addr
+     */
+    uint16_t vsi_flags = le16_to_cpu(*(uint16_t *)&desc->params[6]);
+    uint8_t vsi_type = vsi_flags & 0x3;  /* ICE_AQ_VSI_TYPE_M */
+    
     uint64_t addr = ice_mp_dma_addr(le32_to_cpu(*(uint32_t *)&desc->params[12]),
                                     le32_to_cpu(*(uint32_t *)&desc->params[8]));
     
-    fprintf(stderr, "ice-mp: Add VSI (0x0210) called, DMA addr=0x%lx, datalen=%d\n",
-            addr, le16_to_cpu(desc->datalen));
+        fprintf(stderr, "ice-mp: Add VSI (0x0210) called, raw_vsi_num=0x%04x, requested_vsi_num=%u, valid=%u, DMA addr=0x%lx, vf_id=%u, vsi_flags=0x%04x, vsi_type=%u\n",
+            raw_vsi_num, requested_vsi_num, vsi_num_valid ? 1 : 0, addr, vf_id, vsi_flags, vsi_type);
+    
+    uint8_t vsi_ctx[128] = {0};  /* ice_aqc_vsi_props structure */
     
     if (addr) {
         /* Read VSI context from buffer */
-        uint8_t vsi_ctx[128];  /* ice_aqc_vsi_props structure */
         pci_dma_read(&s->parent_obj, addr, vsi_ctx, sizeof(vsi_ctx));
         
         /* Write back the VSI context - most fields are set by driver */
@@ -1446,11 +2856,72 @@ static void ice_mp_adminq_add_vsi(struct ICEMPState *s, struct ice_mp_aq_desc *d
                 sizeof(vsi_ctx));
     }
     
-    /* Fill response in descriptor params (ice_aqc_add_update_free_vsi_resp) */
-    uint16_t vsi_num = s->next_vsi_num++;
-    uint16_t vsi_used = vsi_num;
+    /* IMPORTANT: If the driver requests a specific VSI number, echo it back.
+     * Otherwise, allocate one from the pool and return it to the driver.
+     */
+    uint16_t vsi_num;
+    if (vsi_num_valid) {
+        vsi_num = requested_vsi_num;
+    } else {
+        if (s->next_vsi_num == 0) {
+            s->next_vsi_num = 1;
+        }
+        vsi_num = s->next_vsi_num++;
+        if (s->next_vsi_num >= ICE_MP_MAX_VSI) {
+            s->next_vsi_num = 1;
+        }
+    }
+    
+    /* Track VSI to port mapping based on VSI type.
+     * ICE_AQ_VSI_TYPE_VF = 0x0, ICE_AQ_VSI_TYPE_PF = 0x2
+     * For PF-type VSIs, the multi-port driver creates them sequentially
+     * for ports 0, 1, 2, 3. The first PF VSI is the default (port 0),
+     * then subsequent ones are for multi-port.
+     */
+    if (vsi_num < ICE_MP_MAX_VSI) {
+        if (vsi_type == 0x2) {  /* ICE_AQ_VSI_TYPE_PF */
+            s->vsi_to_vf[vsi_num] = 0xFFFF;
+            /* Reset PF VSI counter when transitioning from VF to PF creation.
+             * The driver creates PF VSIs in batches (one default + one per port).
+             * Between batches, VF VSIs are created. Resetting on the VF→PF
+             * boundary ensures each batch starts fresh with correct port mapping.
+             */
+            if (!s->last_vsi_was_pf) {
+                fprintf(stderr, "ice-mp: PF VSI batch start - resetting pf_vsi_count from %u to 0\n",
+                        s->pf_vsi_count);
+                s->pf_vsi_count = 0;
+            }
+            /* PF-type VSI: assign port based on creation order within batch.
+             * PF VSI #0 = default (port 0)
+             * PF VSI #1 = multi-port port 0 (port 0)
+             * PF VSI #2 = multi-port port 1 (port 1)
+             * etc.
+             */
+            uint8_t port;
+            if (s->pf_vsi_count == 0) {
+                port = 0;  /* Default PF VSI */
+            } else {
+                port = (s->pf_vsi_count - 1) % s->num_ports;
+            }
+            s->vsi_to_port[vsi_num] = port;
+            s->pf_vsi_count++;
+            s->last_vsi_was_pf = true;
+            fprintf(stderr, "ice-mp: VSI %u (PF type) mapped to port %u (PF VSI #%u)\n",
+                    vsi_num, port, s->pf_vsi_count - 1);
+        } else {
+            /* VF-type VSI or other types */
+            s->vsi_to_vf[vsi_num] = vf_id;
+            s->vsi_to_port[vsi_num] = 0;  /* VF VSIs default to port 0 */
+            s->last_vsi_was_pf = false;
+            fprintf(stderr, "ice-mp: VSI %u (type=%u, vf_id=%u) mapped to port 0\n",
+                    vsi_num, vsi_type, vf_id);
+        }
+    }
+    
+    uint16_t vsi_used = vsi_num + 1;  /* Best-effort count for reporting */
     uint16_t vsi_free = (vsi_used < 255) ? (uint16_t)(255 - vsi_used) : 0;
 
+    /* Fill response in descriptor params (ice_aqc_add_update_free_vsi_resp) */
     *(uint16_t *)&desc->params[0] = cpu_to_le16(vsi_num);
     *(uint16_t *)&desc->params[2] = cpu_to_le16(0);    /* ext_status = 0 */
     *(uint16_t *)&desc->params[4] = cpu_to_le16(vsi_used);
@@ -1460,7 +2931,7 @@ static void ice_mp_adminq_add_vsi(struct ICEMPState *s, struct ice_mp_aq_desc *d
     /* Set retval to 0 for success */
     desc->retval = cpu_to_le16(0);
     
-        fprintf(stderr, "ice-mp: Add VSI response: vsi_num=%u, vsi_used=%u, vsi_free=%u\n",
+    fprintf(stderr, "ice-mp: Add VSI response: vsi_num=%u (echoed from request), vsi_used=%u, vsi_free=%u\n",
             vsi_num, vsi_used, vsi_free);
     
     ice_mp_adminq_complete(s, desc);
@@ -1517,18 +2988,21 @@ static void ice_mp_adminq_query_sched_elems(struct ICEMPState *s, struct ice_mp_
         /* ENTRY_POINT (VSI) */
         elem.parent_teid = cpu_to_le32(0x16000001);
         elem.data.elem_type = ICE_AQC_ELEM_TYPE_ENTRY_POINT;
-    } else if (node_teid > 0x16000002 && node_teid < 0x16000008) {
-        /* SE_GENERIC (Queue Groups) */
-        elem.parent_teid = cpu_to_le32(node_teid - 1);
-        elem.data.elem_type = ICE_AQC_ELEM_TYPE_SE_GENERIC;
-    } else if (node_teid == 0x16000008) {
-        /* Leaf (Queue) */
-        elem.parent_teid = cpu_to_le32(0x16000007);
-        elem.data.elem_type = ICE_AQC_ELEM_TYPE_LEAF;
     } else {
-        /* Unknown TEID - return generic SE */
-        elem.parent_teid = cpu_to_le32(0x16000000);
-        elem.data.elem_type = ICE_AQC_ELEM_TYPE_SE_GENERIC;
+        /* Look up dynamically-created node in the scheduler table */
+        uint32_t idx = node_teid - ICE_MP_SCHED_TEID_BASE;
+        if (idx < ICE_MP_MAX_SCHED_NODES && s->sched_nodes[idx].valid) {
+            elem.parent_teid = cpu_to_le32(s->sched_nodes[idx].parent_teid);
+            elem.data.elem_type = s->sched_nodes[idx].elem_type;
+            fprintf(stderr, "ice-mp: 0x0404 query TEID=0x%x -> parent=0x%x type=%d (from table)\n",
+                    node_teid, s->sched_nodes[idx].parent_teid, s->sched_nodes[idx].elem_type);
+        } else {
+            /* Unknown TEID - return as SE_GENERIC with root parent */
+            fprintf(stderr, "ice-mp: 0x0404 query TEID=0x%x -> UNKNOWN, returning root parent\n",
+                    node_teid);
+            elem.parent_teid = cpu_to_le32(0x16000002);
+            elem.data.elem_type = ICE_AQC_ELEM_TYPE_SE_GENERIC;
+        }
     }
 
     elem.data.valid_sections = 0x1;  /* ICE_AQC_ELEM_VALID_GENERIC */
@@ -1675,6 +3149,12 @@ static void ice_mp_adminq_process(struct ICEMPState *s)
 
         fprintf(stderr, "ice-mp: AQ opcode 0x%04x (head=%d tail=%d)\n", 
                 le16_to_cpu(desc.opcode), s->atq_head, s->atq_tail);
+        
+        if (le16_to_cpu(desc.opcode) == ICE_MP_AQC_OPC_GET_LINK_STATUS) {
+            fprintf(stderr, "ice-mp: Get Link Status descriptor params: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    desc.params[0], desc.params[1], desc.params[2], desc.params[3],
+                    desc.params[4], desc.params[5], desc.params[6], desc.params[7]);
+        }
 
         switch (le16_to_cpu(desc.opcode)) {
         case ICE_MP_AQC_OPC_GET_VER:
@@ -1717,7 +3197,7 @@ static void ice_mp_adminq_process(struct ICEMPState *s)
             ice_mp_adminq_free_res(s, &desc);
             break;
         case ICE_MP_AQC_OPC_GET_PHY_CAPS:
-            ice_mp_adminq_complete(s, &desc);
+            ice_mp_adminq_get_phy_caps(s, &desc);
             break;
         case 0x040F:  /* Delete Scheduler Elements */
             ice_mp_adminq_delete_sched_elems(s, &desc);
@@ -1783,12 +3263,44 @@ static void ice_mp_adminq_process(struct ICEMPState *s)
         case 0x02A0:  /* Add Switch Rules */
         case 0x02A1:  /* Update Switch Rules */
         case 0x02A2:  /* Remove Switch Rules */
-            fprintf(stderr, "ice-mp: Switch Rules opcode 0x%04x - returning success\n",
-                    le16_to_cpu(desc.opcode));
-            ice_mp_adminq_complete(s, &desc);
+            ice_mp_adminq_sw_rules(s, &desc, le16_to_cpu(desc.opcode));
             break;
         case 0x0C30:  /* Add Tx LAN Queues */
-        case 0x0C31:  /* Disable Tx LAN Queues */
+            ice_mp_adminq_add_tx_queues(s, &desc);
+            break;
+        case 0x0C31: {  /* Disable Tx LAN Queues */
+            fprintf(stderr, "ice-mp: Disable Tx LAN Queues (0x0C31)\n");
+            /* Parse the disable command buffer to find which queues to disable.
+             * The buffer format is ice_aqc_dis_txq_item entries.
+             * For simplicity, disable all queues referenced by the command.
+             */
+            uint64_t dis_addr = ice_mp_dma_addr(
+                le32_to_cpu(*(uint32_t *)&desc.params[12]),
+                le32_to_cpu(*(uint32_t *)&desc.params[8]));
+            uint16_t dis_buf_len = le16_to_cpu(desc.datalen);
+            if (dis_addr && dis_buf_len >= 8) {
+                uint8_t *dis_buf = g_malloc(dis_buf_len);
+                pci_dma_read(&s->parent_obj, dis_addr, dis_buf, dis_buf_len);
+                /* Parse: first 4 bytes = parent_teid, byte 4 = num_qs */
+                uint8_t num_qs = dis_buf[4];
+                for (int dq = 0; dq < num_qs && (8 + dq * 8 + 8) <= dis_buf_len; dq++) {
+                    /* Each ice_aqc_dis_txq_item: teid(4) + txq_id(2) + q_handle(2) = 8 bytes */
+                    uint16_t dis_qid;
+                    memcpy(&dis_qid, dis_buf + 8 + dq * 8 + 4, 2);  /* txq_id at offset 4 within entry */
+                    dis_qid = le16_to_cpu(dis_qid);
+                    if (dis_qid < ICE_MP_MAX_TX_QUEUES) {
+                        s->txq[dis_qid].enabled = false;
+                        s->txq[dis_qid].configured = false;
+                        s->txq[dis_qid].head = 0;
+                        s->txq[dis_qid].tail = 0;
+                        fprintf(stderr, "ice-mp: Disabled TX queue %u\n", dis_qid);
+                    }
+                }
+                g_free(dis_buf);
+            }
+            ice_mp_adminq_complete(s, &desc);
+            break;
+        }
         case 0x0C32:  /* Move/Reconfigure Tx Queues */
             fprintf(stderr, "ice-mp: Tx Queue opcode 0x%04x - returning success\n",
                     le16_to_cpu(desc.opcode));
@@ -2065,8 +3577,67 @@ static uint64_t ice_mp_mmio_read(void *opaque, hwaddr addr, unsigned size)
         break;
     
     default:
+        if (addr >= ICE_MP_REG_QTX_COMM_HEAD &&
+            addr < ICE_MP_REG_QTX_COMM_HEAD + (ICE_MP_MAX_TX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QTX_COMM_HEAD) / 4;
+            if (qid < ICE_MP_MAX_TX_QUEUES) {
+                val = s->txq[qid].head;
+                fprintf(stderr, "ice-mp: QTX_COMM_HEAD read qid=%u head=%u conf=%d ena=%d base=0x%lx tail=%u\n",
+                        qid, s->txq[qid].head, s->txq[qid].configured, s->txq[qid].enabled,
+                        (unsigned long)s->txq[qid].base, s->txq[qid].tail);
+            }
+        } else if (addr >= ICE_MP_REG_QRX_CTRL &&
+                   addr < ICE_MP_REG_QRX_CTRL + (ICE_MP_MAX_RX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QRX_CTRL) / 4;
+            if (qid < ICE_MP_MAX_RX_QUEUES) {
+                val = s->rxq[qid].ctrl;
+                if (s->rxq[qid].enabled) {
+                    val |= ICE_MP_QRX_CTRL_QENA_STAT_M;
+                }
+            }
+        } else if (addr >= ICE_MP_REG_QINT_TQCTL &&
+                   addr < ICE_MP_REG_QINT_TQCTL + (ICE_MP_MAX_TX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QINT_TQCTL) / 4;
+            if (qid < ICE_MP_MAX_TX_QUEUES) {
+                val = s->txq[qid].int_ctl;
+            }
+        } else if (addr >= ICE_MP_REG_QINT_RQCTL &&
+                   addr < ICE_MP_REG_QINT_RQCTL + (ICE_MP_MAX_RX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QINT_RQCTL) / 4;
+            if (qid < ICE_MP_MAX_RX_QUEUES) {
+                val = s->rxq[qid].int_ctl;
+            }
+        } else if (addr >= ICE_MP_REG_GLINT_DYN_CTL &&
+                   addr < ICE_MP_REG_GLINT_DYN_CTL + (ICE_MP_MSIX_VECTORS * 4)) {
+            uint32_t vec = (addr - ICE_MP_REG_GLINT_DYN_CTL) / 4;
+            if (vec < ICE_MP_MSIX_VECTORS) {
+                val = s->glint_dyn_ctl[vec];
+            }
+        } else if (addr == ICE_MP_REG_GLCOMM_QTX_CNTX_CTL) {
+            val = s->glcomm_qtx_cntx_ctl;
+        } else if (addr >= ICE_MP_REG_GLCOMM_QTX_CNTX_DATA &&
+                   addr < ICE_MP_REG_GLCOMM_QTX_CNTX_DATA +
+                          (ICE_MP_TX_CTX_DWORDS * 4)) {
+            uint32_t idx = (addr - ICE_MP_REG_GLCOMM_QTX_CNTX_DATA) / 4;
+            if (idx < ICE_MP_TX_CTX_DWORDS) {
+                val = s->glcomm_qtx_cntx_data[idx];
+            }
+        } else if (addr >= ICE_MP_REG_QRX_CONTEXT &&
+                   addr < ICE_MP_REG_QRX_CONTEXT +
+                          (ICE_MP_RX_CTX_DWORDS * ICE_MP_QRX_CONTEXT_STRIDE)) {
+            /* QRX_CONTEXT(_i, _QRX) = 0x280000 + (_i * 8192 + _QRX * 4)
+             * _i = DWORD index (0-7), uses 8192-byte stride
+             * _QRX = queue index, uses 4-byte stride within each DWORD block
+             */
+            uint32_t offset = addr - ICE_MP_REG_QRX_CONTEXT;
+            uint32_t idx = offset / ICE_MP_QRX_CONTEXT_STRIDE;  /* DWORD index */
+            uint32_t qid = (offset % ICE_MP_QRX_CONTEXT_STRIDE) / 4;  /* queue ID */
+            if (idx < ICE_MP_RX_CTX_DWORDS && qid < ICE_MP_MAX_RX_QUEUES) {
+                val = s->rx_ctx[qid][idx];
+            }
+        }
         /* Port status registers */
-        if (addr >= ICE_MP_REG_PORT_STATUS && 
+        else if (addr >= ICE_MP_REG_PORT_STATUS && 
             addr < ICE_MP_REG_PORT_STATUS + (ICE_MP_MAX_PORTS * 4)) {
             uint32_t port_id = (addr - ICE_MP_REG_PORT_STATUS) / 4;
             if (port_id < s->num_ports) {
@@ -2113,6 +3684,36 @@ static uint64_t ice_mp_mmio_read(void *opaque, hwaddr addr, unsigned size)
             uint32_t vf_id = addr - ICE_MP_REG_VF_PORT_MAP;
             if (vf_id < s->num_vfs) {
                 val = s->vf_port_map[vf_id];
+            }
+        }
+        /* VF RX queue base/map enable registers */
+        else if (addr >= ICE_MP_REG_VPLAN_RX_QBASE &&
+                 addr < ICE_MP_REG_VPLAN_RX_QBASE + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_RX_QBASE) / 4;
+            if (vf_id < s->num_vfs) {
+                val = (s->vf_rxq_base[vf_id] & ICE_MP_VPLAN_RX_QBASE_VFFIRSTQ_M) |
+                      ((uint32_t)s->vf_rxq_num[vf_id] << 16);
+            }
+        } else if (addr >= ICE_MP_REG_VPLAN_RXQ_MAPENA &&
+                   addr < ICE_MP_REG_VPLAN_RXQ_MAPENA + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_RXQ_MAPENA) / 4;
+            if (vf_id < s->num_vfs) {
+                val = s->vf_rxq_mapena[vf_id] ? ICE_MP_VPLAN_RXQ_MAPENA_RX_ENA_M : 0;
+            }
+        }
+        /* VF TX queue base/map enable registers */
+        else if (addr >= ICE_MP_REG_VPLAN_TX_QBASE &&
+                 addr < ICE_MP_REG_VPLAN_TX_QBASE + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_TX_QBASE) / 4;
+            if (vf_id < s->num_vfs) {
+                val = (s->vf_txq_base[vf_id] & ICE_MP_VPLAN_TX_QBASE_VFFIRSTQ_M) |
+                      ((uint32_t)s->vf_txq_num[vf_id] << 16);
+            }
+        } else if (addr >= ICE_MP_REG_VPLAN_TXQ_MAPENA &&
+                   addr < ICE_MP_REG_VPLAN_TXQ_MAPENA + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_TXQ_MAPENA) / 4;
+            if (vf_id < s->num_vfs) {
+                val = s->vf_txq_mapena[vf_id] ? ICE_MP_VPLAN_TXQ_MAPENA_TX_ENA_M : 0;
             }
         }
         break;
@@ -2229,8 +3830,200 @@ static void ice_mp_mmio_write(void *opaque, hwaddr addr,
         break;
     
     default:
+        if (addr >= ICE_MP_REG_QTX_COMM_DBELL &&
+            addr < ICE_MP_REG_QTX_COMM_DBELL + (ICE_MP_MAX_TX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QTX_COMM_DBELL) / 4;
+            if (qid < ICE_MP_MAX_TX_QUEUES) {
+                s->txq[qid].tail = (uint16_t)val;
+                fprintf(stderr, "ice-mp: TX doorbell qid=%u tail=%u head=%u enabled=%d\n",
+                        qid, s->txq[qid].tail, s->txq[qid].head, s->txq[qid].enabled);
+                ice_mp_tx_process_queue(s, qid);
+            }
+        } else if (addr >= ICE_MP_REG_QRX_TAIL &&
+                   addr < ICE_MP_REG_QRX_TAIL + (ICE_MP_MAX_RX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QRX_TAIL) / 4;
+            if (qid < ICE_MP_MAX_RX_QUEUES) {
+                s->rxq[qid].tail = (uint16_t)val;
+                fprintf(stderr, "ice-mp: QRX_TAIL write qid=%u tail=%u head=%u configured=%d enabled=%d base=0x%lx qlen=%u port=%u\n",
+                        qid, s->rxq[qid].tail, s->rxq[qid].head,
+                        s->rxq[qid].configured, s->rxq[qid].enabled,
+                        s->rxq[qid].base, s->rxq[qid].qlen, s->rxq[qid].port_id);
+                /* Flush any pending received packets now that descriptors are available */
+                qemu_flush_queued_packets(qemu_get_queue(s->nic[s->rxq[qid].port_id < s->num_ports ? s->rxq[qid].port_id : 0]));
+            }
+        } else if (addr >= ICE_MP_REG_QRX_CTRL &&
+                   addr < ICE_MP_REG_QRX_CTRL + (ICE_MP_MAX_RX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QRX_CTRL) / 4;
+            fprintf(stderr, "ice-mp: QRX_CTRL write qid=%u val=0x%x\n", qid, (uint32_t)val);
+            if (qid < ICE_MP_MAX_RX_QUEUES) {
+                s->rxq[qid].ctrl = (uint32_t)val;
+                if (val & ICE_MP_QRX_CTRL_QENA_REQ_M) {
+                    /* Enable queue: set both QENA_REQ and QENA_STAT */
+                    s->rxq[qid].enabled = true;
+                    s->rxq[qid].ctrl |= ICE_MP_QRX_CTRL_QENA_STAT_M;
+                    fprintf(stderr, "ice-mp: Enabling RX queue %u (QENA_REQ set) configured=%d base=0x%lx qlen=%u port=%u head=%u tail=%u\n",
+                            qid, s->rxq[qid].configured, s->rxq[qid].base,
+                            s->rxq[qid].qlen, s->rxq[qid].port_id,
+                            s->rxq[qid].head, s->rxq[qid].tail);
+                    /* Flush pending packets now that queue is enabled */
+                    if (s->rxq[qid].configured && s->rxq[qid].port_id < s->num_ports) {
+                        qemu_flush_queued_packets(qemu_get_queue(s->nic[s->rxq[qid].port_id]));
+                    }
+                } else {
+                    /* Disable queue: clear QENA_STAT */
+                    s->rxq[qid].enabled = false;
+                    s->rxq[qid].ctrl &= ~ICE_MP_QRX_CTRL_QENA_STAT_M;
+                    fprintf(stderr, "ice-mp: Disabling RX queue %u (QENA_REQ cleared)\n", qid);
+                }
+            }
+        } else if (addr >= ICE_MP_REG_QINT_TQCTL &&
+                   addr < ICE_MP_REG_QINT_TQCTL + (ICE_MP_MAX_TX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QINT_TQCTL) / 4;
+            if (qid < ICE_MP_MAX_TX_QUEUES) {
+                s->txq[qid].int_ctl = (uint32_t)val;
+                fprintf(stderr, "ice-mp: QINT_TQCTL write qid=%u val=0x%x msix_idx=%u cause_ena=%d\n",
+                        qid, (uint32_t)val, (uint32_t)(val & ICE_MP_QINT_MSIX_INDX_M),
+                        !!(val & ICE_MP_QINT_CAUSE_ENA_M));
+            }
+        } else if (addr >= ICE_MP_REG_QINT_RQCTL &&
+                   addr < ICE_MP_REG_QINT_RQCTL + (ICE_MP_MAX_RX_QUEUES * 4)) {
+            uint32_t qid = (addr - ICE_MP_REG_QINT_RQCTL) / 4;
+            if (qid < ICE_MP_MAX_RX_QUEUES) {
+                s->rxq[qid].int_ctl = (uint32_t)val;
+                uint16_t msix_idx = (uint16_t)(val & ICE_MP_QINT_MSIX_INDX_M);
+                
+                /* Determine RX queue's port by matching its MSI-X vector
+                 * with a configured TX queue that uses the same vector.
+                 * The driver allocates the same MSI-X vector for paired
+                 * TX and RX queues on the same port.
+                 */
+                bool port_found = false;
+                for (uint16_t txq = 0; txq < ICE_MP_MAX_TX_QUEUES; txq++) {
+                    if (s->txq[txq].configured &&
+                        (s->txq[txq].int_ctl & ICE_MP_QINT_MSIX_INDX_M) == msix_idx) {
+                        s->rxq[qid].port_id = s->txq[txq].port_id;
+                        port_found = true;
+                        fprintf(stderr, "ice-mp: QINT_RQCTL write qid=%u msix_idx=%u -> port=%u (matched TX qid=%u)\n",
+                                qid, msix_idx, s->rxq[qid].port_id, txq);
+                        break;
+                    }
+                }
+                if (!port_found) {
+                    fprintf(stderr, "ice-mp: QINT_RQCTL write qid=%u msix_idx=%u (no TX queue match)\n",
+                            qid, msix_idx);
+                }
+            }
+        } else if (addr >= ICE_MP_REG_GLINT_DYN_CTL &&
+                   addr < ICE_MP_REG_GLINT_DYN_CTL + (ICE_MP_MSIX_VECTORS * 4)) {
+            uint32_t vec = (addr - ICE_MP_REG_GLINT_DYN_CTL) / 4;
+            if (vec < ICE_MP_MSIX_VECTORS) {
+                bool masked;
+                bool new_intena = !!(val & ICE_MP_GLINT_DYN_CTL_INTENA_M);
+
+                s->glint_dyn_ctl[vec] = (uint32_t)val;
+                masked = msix_is_masked(&s->parent_obj, vec);
+
+                fprintf(stderr,
+                        "ice-mp: GLINT_DYN_CTL write vec=%u val=0x%x intena=%d msk=%d swint=%d wb_on_itr=%d masked=%d pending=%d\n",
+                        vec, (uint32_t)val,
+                        new_intena,
+                        !!(val & ICE_MP_GLINT_DYN_CTL_INTENA_MSK_M),
+                        !!(val & ICE_MP_GLINT_DYN_CTL_SWINT_TRIG_M),
+                        !!(val & ICE_MP_GLINT_DYN_CTL_WB_ON_ITR_M),
+                        masked,
+                        s->irq_pending[vec]);
+
+                /* SWINT_TRIG (bit 2) + INTENA (bit 0): trigger software interrupt */
+                if ((val & ICE_MP_GLINT_DYN_CTL_SWINT_TRIG_M) &&
+                    new_intena) {
+                    if (msix_enabled(&s->parent_obj) && vec < ICE_MP_MSIX_VECTORS) {
+                        s->irq_pending[vec] = false;
+                        fprintf(stderr,
+                                "ice-mp: SWINT IRQ vec=%u masked=%d (SWINT+INTENA triggered)\n",
+                                vec, masked);
+                        msix_notify(&s->parent_obj, vec);
+                    }
+                }
+                /* When INTENA set to 1: deliver any pending interrupt that was
+                 * suppressed while INTENA was 0.  This matches real E810
+                 * behavior where re-enabling causes pending causes to fire.
+                 */
+                else if (new_intena && s->irq_pending[vec]) {
+                    s->irq_pending[vec] = false;
+                    if (msix_enabled(&s->parent_obj) && vec < ICE_MP_MSIX_VECTORS) {
+                        fprintf(stderr,
+                                "ice-mp: pending IRQ delivered vec=%u (INTENA re-enabled)\n",
+                                vec);
+                        msix_notify(&s->parent_obj, vec);
+                    }
+                }
+
+                /* Flush any queued TAP packets for ports using this vector */
+                if (new_intena) {
+                    for (uint16_t qi = 0; qi < ICE_MP_MAX_RX_QUEUES; qi++) {
+                        if (s->rxq[qi].configured && s->rxq[qi].enabled &&
+                            (s->rxq[qi].int_ctl & ICE_MP_QINT_MSIX_INDX_M) == vec) {
+                            uint8_t pid = s->rxq[qi].port_id;
+                            if (pid < s->num_ports && s->nic[pid]) {
+                                qemu_flush_queued_packets(
+                                    qemu_get_queue(s->nic[pid]));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (addr == ICE_MP_REG_GLCOMM_QTX_CNTX_CTL) {
+            uint32_t cmd = (val & ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_M) >> 16;
+            uint32_t qid = val & ICE_MP_GLCOMM_QTX_CNTX_CTL_QUEUE_ID_M;
+
+            s->glcomm_qtx_cntx_ctl = (uint32_t)val;
+
+            fprintf(stderr, "ice-mp: GLCOMM_QTX_CNTX_CTL write val=0x%lx qid=%u cmd=%u exec=%d\n",
+                    val, qid, cmd, !!(val & ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_EXEC));
+
+            if ((val & ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_EXEC) &&
+                qid < ICE_MP_MAX_TX_QUEUES) {
+                if (cmd == ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_WRITE_NO_DYN) {
+                    fprintf(stderr, "ice-mp: Writing TX ctx for qid=%u\n", qid);
+                    for (uint32_t i = 0; i < ICE_MP_TX_CTX_DWORDS; i++) {
+                        s->tx_ctx[qid][i] = s->glcomm_qtx_cntx_data[i];
+                    }
+                    ice_mp_update_txq_from_ctx(s, (uint16_t)qid);
+                } else if (cmd == ICE_MP_GLCOMM_QTX_CNTX_CTL_CMD_READ) {
+                    for (uint32_t i = 0; i < ICE_MP_TX_CTX_DWORDS; i++) {
+                        s->glcomm_qtx_cntx_data[i] = s->tx_ctx[qid][i];
+                    }
+                }
+            }
+        } else if (addr >= ICE_MP_REG_GLCOMM_QTX_CNTX_DATA &&
+                   addr < ICE_MP_REG_GLCOMM_QTX_CNTX_DATA +
+                          (ICE_MP_TX_CTX_DWORDS * 4)) {
+            uint32_t idx = (addr - ICE_MP_REG_GLCOMM_QTX_CNTX_DATA) / 4;
+            if (idx < ICE_MP_TX_CTX_DWORDS) {
+                s->glcomm_qtx_cntx_data[idx] = (uint32_t)val;
+            }
+        } else if (addr >= ICE_MP_REG_QRX_CONTEXT &&
+                   addr < ICE_MP_REG_QRX_CONTEXT +
+                          (ICE_MP_RX_CTX_DWORDS * ICE_MP_QRX_CONTEXT_STRIDE)) {
+            /* QRX_CONTEXT(_i, _QRX) = 0x280000 + (_i * 8192 + _QRX * 4)
+             * _i = DWORD index (0-7), uses 8192-byte stride
+             * _QRX = queue index, uses 4-byte stride within each DWORD block
+             */
+            uint32_t offset = addr - ICE_MP_REG_QRX_CONTEXT;
+            uint32_t idx = offset / ICE_MP_QRX_CONTEXT_STRIDE;  /* DWORD index */
+            uint32_t qid = (offset % ICE_MP_QRX_CONTEXT_STRIDE) / 4;  /* queue ID */
+            if (idx < ICE_MP_RX_CTX_DWORDS && qid < ICE_MP_MAX_RX_QUEUES) {
+                s->rx_ctx[qid][idx] = (uint32_t)val;
+                ice_mp_update_rxq_from_ctx(s, (uint16_t)qid);
+                if (idx == ICE_MP_RX_CTX_DWORDS - 1) {
+                    fprintf(stderr, "ice-mp: RX context write complete qid=%u base=0x%lx qlen=%u configured=%d port=%u\n",
+                            qid, s->rxq[qid].base, s->rxq[qid].qlen, s->rxq[qid].configured, s->rxq[qid].port_id);
+                }
+            }
+        }
         /* Port status - allow external control for testing */
-        if (addr >= ICE_MP_REG_PORT_STATUS && 
+        else if (addr >= ICE_MP_REG_PORT_STATUS && 
             addr < ICE_MP_REG_PORT_STATUS + (ICE_MP_MAX_PORTS * 4)) {
             uint32_t port_id = (addr - ICE_MP_REG_PORT_STATUS) / 4;
             if (port_id < s->num_ports) {
@@ -2294,6 +4087,36 @@ static void ice_mp_mmio_write(void *opaque, hwaddr addr,
                         vf_id, new_port, s->num_vfs, s->num_ports);
             }
         }
+        /* VF RX queue base/map enable registers */
+        else if (addr >= ICE_MP_REG_VPLAN_RX_QBASE &&
+                 addr < ICE_MP_REG_VPLAN_RX_QBASE + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_RX_QBASE) / 4;
+            if (vf_id < s->num_vfs) {
+                s->vf_rxq_base[vf_id] = val & ICE_MP_VPLAN_RX_QBASE_VFFIRSTQ_M;
+                s->vf_rxq_num[vf_id] = (val & ICE_MP_VPLAN_RX_QBASE_VFNUMQ_M) >> 16;
+            }
+        } else if (addr >= ICE_MP_REG_VPLAN_RXQ_MAPENA &&
+                   addr < ICE_MP_REG_VPLAN_RXQ_MAPENA + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_RXQ_MAPENA) / 4;
+            if (vf_id < s->num_vfs) {
+                s->vf_rxq_mapena[vf_id] = (val & ICE_MP_VPLAN_RXQ_MAPENA_RX_ENA_M) != 0;
+            }
+        }
+        /* VF TX queue base/map enable registers */
+        else if (addr >= ICE_MP_REG_VPLAN_TX_QBASE &&
+                 addr < ICE_MP_REG_VPLAN_TX_QBASE + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_TX_QBASE) / 4;
+            if (vf_id < s->num_vfs) {
+                s->vf_txq_base[vf_id] = val & ICE_MP_VPLAN_TX_QBASE_VFFIRSTQ_M;
+                s->vf_txq_num[vf_id] = (val & ICE_MP_VPLAN_TX_QBASE_VFNUMQ_M) >> 16;
+            }
+        } else if (addr >= ICE_MP_REG_VPLAN_TXQ_MAPENA &&
+                   addr < ICE_MP_REG_VPLAN_TXQ_MAPENA + (ICE_MP_MAX_VFS * 4)) {
+            uint32_t vf_id = (addr - ICE_MP_REG_VPLAN_TXQ_MAPENA) / 4;
+            if (vf_id < s->num_vfs) {
+                s->vf_txq_mapena[vf_id] = (val & ICE_MP_VPLAN_TXQ_MAPENA_TX_ENA_M) != 0;
+            }
+        }
         break;
     }
 }
@@ -2334,7 +4157,7 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Initialize BAR1 for MSI-X */
     s->msix_bar_idx = 1;
-    memory_region_init(&s->bar1, OBJECT(s), "ice-mp-msix", 0x2000);
+    memory_region_init(&s->bar1, OBJECT(s), "ice-mp-msix", 0x4000);
     pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar1);
     
     ret = msix_init(pci_dev, ICE_MP_MSIX_VECTORS,
@@ -2345,9 +4168,24 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
         return;
     }
 
+    /* Mark all MSI-X vectors as used so msix_notify() will deliver them.
+     * Without this, msix_notify() silently drops interrupts because
+     * msix_entry_used[vector] is 0 for all vectors. */
+    for (int i = 0; i < ICE_MP_MSIX_VECTORS; i++) {
+        msix_vector_use(pci_dev, i);
+    }
+
+    /* Initialize deferred interrupt timer */
+    s->tx_irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   ice_mp_tx_irq_timer_cb, s);
+    s->tx_irq_pending = 0;
+
     /* Initialize SR-IOV if VFs are configured */
     if (s->num_vfs > 0) {
         uint32_t init_vfs = s->num_vfs;
+        /* Mark PF as multifunction so VFs at non-zero functions pass
+         * pci_init_multifunction() validation in QEMU's PCI core */
+        pci_dev->cap_present |= QEMU_PCI_CAP_MULTIFUNCTION;
         fprintf(stderr, "ice-mp: SR-IOV total_vfs=%u initial_vfs=%u\n",
                 s->num_vfs, init_vfs);
         pcie_sriov_pf_init(pci_dev, ICE_MP_SRIOV_OFFSET, "pci-ice-mp-vf",
@@ -2373,15 +4211,36 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
     }
     s->port_count = s->num_ports;
     
-    /* Initialize all ports as link down, 25G speed */
+    /* Initialize all ports as link UP at 100Gbps (default after power-on) */
     for (uint32_t i = 0; i < s->num_ports; i++) {
-        s->port_status[i] = (ICE_MP_SPEED_25G << ICE_MP_PORT_SPEED_SHIFT);
+        s->port_status[i] = ICE_MP_PORT_LINK_UP | 
+                           (ICE_MP_SPEED_100G << ICE_MP_PORT_SPEED_SHIFT);
+        fprintf(stderr, "ice-mp: realize() - Port %u initialized: port_status=0x%x (LINK_UP=0x%x)\n",
+                i, s->port_status[i], ICE_MP_PORT_LINK_UP);
     }
     
     /* Initialize VF-to-port mapping (round-robin) */
     for (uint32_t i = 0; i < s->num_vfs; i++) {
         s->vf_port_map[i] = i % s->num_ports;
     }
+
+    for (uint32_t i = 0; i < ICE_MP_MAX_VSI; i++) {
+        s->vsi_to_vf[i] = 0xFFFF;
+        s->vsi_to_port[i] = 0;
+    }
+    s->pf_vsi_count = 0;
+    s->last_vsi_was_pf = false;
+
+    for (uint32_t i = 0; i < s->num_vfs; i++) {
+        s->vf_rxq_base[i] = 0;
+        s->vf_rxq_num[i] = 0;
+        s->vf_rxq_mapena[i] = false;
+        s->vf_txq_base[i] = 0;
+        s->vf_txq_num[i] = 0;
+        s->vf_txq_mapena[i] = false;
+    }
+
+    ice_mp_rule_clear_all(s);
     
     s->event_doorbell = 0;
     s->pfgen_ctrl = 0;
@@ -2467,12 +4326,42 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
     /* Initialize scheduler TEID counter (start after reserved nodes) */
     s->next_sched_teid = 0x16000003;  /* Next after minimal topology (root + TC + entry point) */
     s->next_vsi_num = 1;
+
+    /* Initialize base scheduler node table entries */
+    memset(s->sched_nodes, 0, sizeof(s->sched_nodes));
+    /* Root node: index 0 = TEID 0x16000000, parent=0xFFFFFFFF */
+    s->sched_nodes[0].valid = true;
+    s->sched_nodes[0].parent_teid = 0xFFFFFFFF;
+    s->sched_nodes[0].elem_type = ICE_AQC_ELEM_TYPE_ROOT_PORT;
+    /* TC node: index 1 = TEID 0x16000001, parent=root */
+    s->sched_nodes[1].valid = true;
+    s->sched_nodes[1].parent_teid = 0x16000000;
+    s->sched_nodes[1].elem_type = ICE_AQC_ELEM_TYPE_TC;
+    /* Entry point: index 2 = TEID 0x16000002, parent=TC */
+    s->sched_nodes[2].valid = true;
+    s->sched_nodes[2].parent_teid = 0x16000001;
+    s->sched_nodes[2].elem_type = ICE_AQC_ELEM_TYPE_ENTRY_POINT;
+
+    ice_mp_init_nics(s, pci_dev);
 }
 
 /* Device cleanup */
 static void ice_mp_exit(PCIDevice *pci_dev)
 {
     ICEMPState *s = ICE_MP(pci_dev);
+
+    /* Free deferred interrupt timer */
+    if (s->tx_irq_timer) {
+        timer_free(s->tx_irq_timer);
+        s->tx_irq_timer = NULL;
+    }
+
+    for (uint32_t i = 0; i < s->num_ports; i++) {
+        if (s->nic[i]) {
+            qemu_del_nic(s->nic[i]);
+            s->nic[i] = NULL;
+        }
+    }
     
     /* Free allocated flash arrays */
     g_free(s->nvm_flash);
@@ -2507,6 +4396,24 @@ static void ice_mp_reset_hold(Object *obj, ResetType type)
     
     s->next_vsi_num = 1;
 
+    ice_mp_rule_clear_all(s);
+
+    for (uint32_t i = 0; i < ICE_MP_MAX_VSI; i++) {
+        s->vsi_to_vf[i] = 0xFFFF;
+        s->vsi_to_port[i] = 0;
+    }
+    s->pf_vsi_count = 0;
+    s->last_vsi_was_pf = false;
+
+    for (uint32_t i = 0; i < s->num_vfs; i++) {
+        s->vf_rxq_base[i] = 0;
+        s->vf_rxq_num[i] = 0;
+        s->vf_rxq_mapena[i] = false;
+        s->vf_txq_base[i] = 0;
+        s->vf_txq_num[i] = 0;
+        s->vf_txq_mapena[i] = false;
+    }
+
     for (uint32_t i = 0; i < s->num_vfs; i++) {
         s->vf_mbx_atqlen[i] = 0;
         s->vf_mbx_arqlen[i] = 0;
@@ -2516,6 +4423,18 @@ static void ice_mp_reset_hold(Object *obj, ResetType type)
     }
     s->pf_pci_ciaa = 0;
     s->pf_pci_ciad = 0;
+
+    for (uint32_t i = 0; i < ICE_MP_MAX_TX_QUEUES; i++) {
+        s->txq[i].head = 0;
+        s->txq[i].tail = 0;
+        s->txq[i].enabled = false;
+    }
+
+    for (uint32_t i = 0; i < ICE_MP_MAX_RX_QUEUES; i++) {
+        s->rxq[i].head = 0;
+        s->rxq[i].tail = 0;
+        s->rxq[i].enabled = false;
+    }
 
     /* Inject reset event */
     s->event_doorbell = (ICE_MP_EVENT_RESET << 8);
@@ -2528,6 +4447,16 @@ static void ice_mp_reset_hold(Object *obj, ResetType type)
 static Property ice_mp_properties[] = {
     DEFINE_PROP_UINT32("ports", ICEMPState, num_ports, 4),
     DEFINE_PROP_UINT32("vfs", ICEMPState, num_vfs, 0),
+    DEFINE_PROP_UINT32("rxq-map-mode", ICEMPState, rxq_map_mode, 0),
+    DEFINE_PROP_UINT32("queues-per-port", ICEMPState, queues_per_port, 0),
+    DEFINE_PROP_NETDEV("netdev0", ICEMPState, conf[0].peers),
+    DEFINE_PROP_NETDEV("netdev1", ICEMPState, conf[1].peers),
+    DEFINE_PROP_NETDEV("netdev2", ICEMPState, conf[2].peers),
+    DEFINE_PROP_NETDEV("netdev3", ICEMPState, conf[3].peers),
+    DEFINE_PROP_MACADDR("mac0", ICEMPState, conf[0].macaddr),
+    DEFINE_PROP_MACADDR("mac1", ICEMPState, conf[1].macaddr),
+    DEFINE_PROP_MACADDR("mac2", ICEMPState, conf[2].macaddr),
+    DEFINE_PROP_MACADDR("mac3", ICEMPState, conf[3].macaddr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -2568,6 +4497,7 @@ static void ice_mp_vf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
 static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
 {
     ICEMPVFState *vf = ICE_MP_VF(pci_dev);
+    uint8_t *pci_conf = pci_dev->config;
     static const MemoryRegionOps vf_mmio_ops = {
         .read = ice_mp_vf_mmio_read,
         .write = ice_mp_vf_mmio_write,
@@ -2577,6 +4507,21 @@ static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
             .max_access_size = 4,
         },
     };
+
+    /* Initialize PCI config space for VF immediately */
+    pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_INTEL);
+    pci_config_set_device_id(pci_conf, ICE_MP_VF_DEV_ID);
+    pci_config_set_class(pci_conf, PCI_CLASS_NETWORK_ETHERNET);
+    pci_config_set_revision(pci_conf, 0x01);
+    
+    /* Enable memory space access */
+    pci_set_word(pci_conf + PCI_COMMAND, PCI_COMMAND_MEMORY);
+    
+    fprintf(stderr, "ice-mp-vf: realize() - devfn=0x%x, vendor=0x%04x, device=0x%04x, cmd=0x%04x\n",
+            pci_dev->devfn,
+            pci_get_word(pci_conf + PCI_VENDOR_ID),
+            pci_get_word(pci_conf + PCI_DEVICE_ID),
+            pci_get_word(pci_conf + PCI_COMMAND));
 
     if (pcie_endpoint_cap_init(pci_dev, 0x80) < 0) {
         error_setg(errp, "Failed to initialize PCIe capability (VF)");

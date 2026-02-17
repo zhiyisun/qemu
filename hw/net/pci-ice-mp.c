@@ -36,7 +36,7 @@
 
 /* PCI Configuration */
 #define PCI_VENDOR_ID_INTEL     0x8086
-#define PCI_DEVICE_ID_ICE_MP    0xFFFF
+#define PCI_DEVICE_ID_ICE_MP    0x1592  /* E810-C for QSFP */
 
 /* BAR0 Size (4MB) */
 #define ICE_MP_BAR0_SIZE        0x00800000  /* 8MB MMIO space */

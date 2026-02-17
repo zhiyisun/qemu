@@ -3445,9 +3445,160 @@ static void ice_mp_mailbox_process(struct ICEMPState *s)
 OBJECT_DECLARE_SIMPLE_TYPE(ICEMPState, ICE_MP)
 
 #define TYPE_ICE_MP_VF "pci-ice-mp-vf"
+
+/* VF BAR0 Register Offsets (from iavf_register.h) */
+#define IAVF_VF_QTX_TAIL1(Q)       (0x00000000 + (Q) * 4)
+#define IAVF_VF_QRX_TAIL1(Q)       (0x00002000 + (Q) * 4)
+#define IAVF_VF_VFINT_ITRN1(i,Q)   (0x00002800 + (i) * 64 + (Q) * 4)
+#define IAVF_VF_VFINT_DYN_CTLN1(Q) (0x00003800 + (Q) * 4)
+#define IAVF_VF_VFINT_ICR01        0x00004800
+#define IAVF_VF_VFINT_ICR0_ENA1    0x00005000
+#define IAVF_VF_VFINT_DYN_CTL01    0x00005C00
+#define IAVF_VF_ARQBAH1            0x00006000
+#define IAVF_VF_ATQH1              0x00006400
+#define IAVF_VF_ATQLEN1            0x00006800
+#define IAVF_VF_ARQBAL1            0x00006C00
+#define IAVF_VF_ARQT1              0x00007000
+#define IAVF_VF_ARQH1              0x00007400
+#define IAVF_VF_ATQBAH1            0x00007800
+#define IAVF_VF_ATQBAL1            0x00007C00
+#define IAVF_VF_ARQLEN1            0x00008000
+#define IAVF_VF_ATQT1              0x00008400
+#define IAVF_VF_VFGEN_RSTAT        0x00008800
+#define IAVF_VF_VFQF_HENA(i)      (0x0000C400 + (i) * 4)
+#define IAVF_VF_VFQF_HKEY(i)      (0x0000CC00 + (i) * 4)
+#define IAVF_VF_VFQF_HLUT(i)      (0x0000D000 + (i) * 4)
+
+#define IAVF_VF_BAR0_SIZE          0x00010000  /* 64KB to cover all registers */
+
+/* iavf AdminQ sizes */
+#define IAVF_AQ_MAX_ENTRIES        32
+#define IAVF_AQ_DESC_SIZE          32  /* sizeof(libie_aq_desc) */
+#define IAVF_AQ_MAX_BUF_SIZE      4096
+
+/* VF AdminQ descriptor (matches libie_aq_desc / iavf_aq_desc) */
+struct iavf_aq_desc {
+    uint16_t flags;
+    uint16_t opcode;
+    uint16_t datalen;
+    uint16_t retval;
+    uint32_t cookie_high;  /* virtchnl opcode */
+    uint32_t cookie_low;   /* virtchnl status */
+    uint32_t param0;       /* offset 16 */
+    uint32_t param1;       /* offset 20 */
+    uint32_t addr_high;    /* offset 24 - data buf DMA addr high */
+    uint32_t addr_low;     /* offset 28 - data buf DMA addr low */
+} __attribute__((packed));
+
+/* AQ descriptor flag bits */
+#define IAVF_AQ_FLAG_DD   0x0001
+#define IAVF_AQ_FLAG_CMP  0x0002
+#define IAVF_AQ_FLAG_ERR  0x0004
+#define IAVF_AQ_FLAG_LB   0x0200
+#define IAVF_AQ_FLAG_RD   0x0400
+#define IAVF_AQ_FLAG_BUF  0x1000
+#define IAVF_AQ_FLAG_SI   0x2000
+
+/* AQ opcodes */
+#define IAVF_AQ_OPC_SEND_MSG_TO_PF  0x0801
+#define IAVF_AQ_OPC_SEND_MSG_TO_VF  0x0802
+
+/* virtchnl opcodes */
+#define VIRTCHNL_OP_VERSION              1
+#define VIRTCHNL_OP_GET_VF_RESOURCES     3
+#define VIRTCHNL_OP_CONFIG_VSI_QUEUES    6
+#define VIRTCHNL_OP_CONFIG_IRQ_MAP       7
+#define VIRTCHNL_OP_ENABLE_QUEUES        8
+#define VIRTCHNL_OP_DISABLE_QUEUES       9
+#define VIRTCHNL_OP_ADD_ETH_ADDR         10
+#define VIRTCHNL_OP_DEL_ETH_ADDR         11
+#define VIRTCHNL_OP_ADD_VLAN             12
+#define VIRTCHNL_OP_DEL_VLAN             13
+#define VIRTCHNL_OP_CONFIG_PROMISCUOUS   14
+#define VIRTCHNL_OP_GET_STATS            15
+#define VIRTCHNL_OP_CONFIG_RSS_KEY       23
+#define VIRTCHNL_OP_CONFIG_RSS_LUT       24
+#define VIRTCHNL_OP_GET_OFFLOAD_VLAN_V2  51
+#define VIRTCHNL_OP_GET_SUPPORTED_RXDIDS 44
+#define VIRTCHNL_OP_EVENT                17
+
+/* virtchnl status codes */
+#define VIRTCHNL_STATUS_SUCCESS          0
+#define VIRTCHNL_STATUS_NOT_SUPPORTED    (-64)
+
+/* virtchnl VF offload capability flags */
+#define VIRTCHNL_VF_OFFLOAD_L2           0x00000001
+#define VIRTCHNL_VF_OFFLOAD_RSS_PF       0x00080000
+#define VIRTCHNL_VF_OFFLOAD_VLAN         0x00010000
+#define VIRTCHNL_VF_OFFLOAD_RX_POLLING   0x00020000
+
+/* virtchnl VSI types */
+#define VIRTCHNL_VSI_SRIOV               6
+
+/* VF TX/RX queue limits */
+#define IAVF_VF_MAX_QUEUES               4
+#define IAVF_VF_MSIX_VECTORS             5  /* 4 queue vectors + 1 AdminQ */
+
+typedef struct ICEMPVFQueue {
+    uint64_t base;          /* Ring base DMA address */
+    uint16_t qlen;          /* Number of entries */
+    uint16_t head;
+    uint16_t tail;
+    bool enabled;
+    uint8_t port_id;        /* Assigned port */
+    uint32_t int_ctl;       /* MSI-X vector info (needs u32 for BIT(30) cause_ena) */
+} ICEMPVFQueue;
+
 typedef struct ICEMPVFState {
     PCIDevice parent_obj;
     MemoryRegion bar0;
+
+    /* Link to parent PF (set during realize) */
+    struct ICEMPState *pf;
+    uint16_t vf_number;     /* Logical VF index (0-based) */
+
+    /* AdminQ Send Queue (ASQ) registers */
+    uint32_t atq_bal;
+    uint32_t atq_bah;
+    uint32_t atq_len;       /* bit 31 = enable */
+    uint32_t atq_head;
+    uint32_t atq_tail;
+
+    /* AdminQ Receive Queue (ARQ) registers */
+    uint32_t arq_bal;
+    uint32_t arq_bah;
+    uint32_t arq_len;       /* bit 31 = enable */
+    uint32_t arq_head;
+    uint32_t arq_tail;
+
+    /* Reset status */
+    uint32_t vfgen_rstat;   /* 2 = VFACTIVE */
+
+    /* Interrupt registers */
+    uint32_t vfint_icr01;
+    uint32_t vfint_icr0_ena1;
+    uint32_t vfint_dyn_ctl01;
+    uint32_t vfint_dyn_ctln[IAVF_VF_MSIX_VECTORS];
+    uint32_t vfint_itrn[3][16]; /* 3 throttle types, 16 queues each */
+
+    /* RSS registers */
+    uint32_t vfqf_hena[2];
+    uint32_t vfqf_hkey[13];
+    uint32_t vfqf_hlut[16];
+
+    /* virtchnl state */
+    bool version_negotiated;
+    bool resources_configured;
+    uint16_t vsi_id;        /* Assigned VSI ID */
+    uint8_t mac_addr[6];    /* VF MAC address */
+
+    /* VF TX/RX queues */
+    ICEMPVFQueue txq[IAVF_VF_MAX_QUEUES];
+    ICEMPVFQueue rxq[IAVF_VF_MAX_QUEUES];
+    bool queues_enabled;
+
+    /* MSI-X */
+    MemoryRegion msix_bar;
 } ICEMPVFState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(ICEMPVFState, ICE_MP_VF)
@@ -4192,7 +4343,10 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
                   ICE_MP_VF_DEV_ID, init_vfs, s->num_vfs,
                   ICE_MP_VF_OFFSET, ICE_MP_VF_STRIDE);
         pcie_sriov_pf_init_vf_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY,
-                                  0x1000);
+                                  IAVF_VF_BAR0_SIZE);
+        /* VF BAR 3 for MSI-X table/PBA */
+        pcie_sriov_pf_init_vf_bar(pci_dev, 3, PCI_BASE_ADDRESS_SPACE_MEMORY,
+                                  0x4000);
         fprintf(stderr,
             "ice-mp: SR-IOV cfg vf_offset=0x%x vf_stride=0x%x sup_pg=0x%x sys_pg=0x%x\n",
             pci_get_word(pci_conf + ICE_MP_SRIOV_OFFSET + PCI_SRIOV_VF_OFFSET),
@@ -4482,55 +4636,1051 @@ static void ice_mp_class_init(ObjectClass *klass, void *data)
 
 static uint64_t ice_mp_vf_mmio_read(void *opaque, hwaddr addr, unsigned size)
 {
-    return 0;
+    ICEMPVFState *vf = (ICEMPVFState *)opaque;
+    uint64_t val = 0;
+
+    switch (addr) {
+    case IAVF_VF_VFGEN_RSTAT:
+        val = vf->vfgen_rstat;
+        break;
+
+    /* AdminQ Send Queue (ASQ) registers */
+    case IAVF_VF_ATQBAL1:
+        val = vf->atq_bal;
+        break;
+    case IAVF_VF_ATQBAH1:
+        val = vf->atq_bah;
+        break;
+    case IAVF_VF_ATQLEN1:
+        val = vf->atq_len;
+        break;
+    case IAVF_VF_ATQH1:
+        val = vf->atq_head;
+        break;
+    case IAVF_VF_ATQT1:
+        val = vf->atq_tail;
+        break;
+
+    /* AdminQ Receive Queue (ARQ) registers */
+    case IAVF_VF_ARQBAL1:
+        val = vf->arq_bal;
+        break;
+    case IAVF_VF_ARQBAH1:
+        val = vf->arq_bah;
+        break;
+    case IAVF_VF_ARQLEN1:
+        val = vf->arq_len;
+        break;
+    case IAVF_VF_ARQH1:
+        val = vf->arq_head;
+        break;
+    case IAVF_VF_ARQT1:
+        val = vf->arq_tail;
+        break;
+
+    /* Interrupt registers */
+    case IAVF_VF_VFINT_ICR01:
+        val = vf->vfint_icr01;
+        vf->vfint_icr01 = 0;  /* Clear on read */
+        break;
+    case IAVF_VF_VFINT_ICR0_ENA1:
+        val = vf->vfint_icr0_ena1;
+        break;
+    case IAVF_VF_VFINT_DYN_CTL01:
+        val = vf->vfint_dyn_ctl01;
+        break;
+
+    default:
+        /* TX queue tail registers: 0x0000 + Q*4 */
+        if (addr < IAVF_VF_MAX_QUEUES * 4) {
+            uint32_t q = addr / 4;
+            if (q < IAVF_VF_MAX_QUEUES) {
+                val = vf->txq[q].tail;
+            }
+        }
+        /* RX queue tail registers: 0x2000 + Q*4 */
+        else if (addr >= 0x2000 && addr < 0x2000 + IAVF_VF_MAX_QUEUES * 4) {
+            uint32_t q = (addr - 0x2000) / 4;
+            if (q < IAVF_VF_MAX_QUEUES) {
+                val = vf->rxq[q].tail;
+            }
+        }
+        /* Interrupt throttle: 0x2800 + i*64 + Q*4 */
+        else if (addr >= 0x2800 && addr < 0x2800 + 3 * 64) {
+            uint32_t offset = addr - 0x2800;
+            uint32_t i = offset / 64;
+            uint32_t q = (offset % 64) / 4;
+            if (i < 3 && q < 16) {
+                val = vf->vfint_itrn[i][q];
+            }
+        }
+        /* Per-queue dynamic interrupt control: 0x3800 + Q*4 */
+        else if (addr >= 0x3800 && addr < 0x3800 + IAVF_VF_MSIX_VECTORS * 4) {
+            uint32_t q = (addr - 0x3800) / 4;
+            if (q < IAVF_VF_MSIX_VECTORS) {
+                val = vf->vfint_dyn_ctln[q];
+            }
+        }
+        /* RSS HENA: 0xC400 + i*4 */
+        else if (addr >= 0xC400 && addr < 0xC400 + 2 * 4) {
+            uint32_t i = (addr - 0xC400) / 4;
+            val = vf->vfqf_hena[i];
+        }
+        /* RSS HKEY: 0xCC00 + i*4 */
+        else if (addr >= 0xCC00 && addr < 0xCC00 + 13 * 4) {
+            uint32_t i = (addr - 0xCC00) / 4;
+            val = vf->vfqf_hkey[i];
+        }
+        /* RSS HLUT: 0xD000 + i*4 */
+        else if (addr >= 0xD000 && addr < 0xD000 + 16 * 4) {
+            uint32_t i = (addr - 0xD000) / 4;
+            val = vf->vfqf_hlut[i];
+        }
+        break;
+    }
+
+    return val;
 }
+
+/* Forward declarations */
+static void ice_mp_vf_process_atq(ICEMPVFState *vf);
+static void ice_mp_vf_tx_process(ICEMPVFState *vf, uint16_t qid);
 
 static void ice_mp_vf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)val;
-    (void)size;
+    ICEMPVFState *vf = (ICEMPVFState *)opaque;
+
+    switch (addr) {
+    /* AdminQ Send Queue (ASQ) registers */
+    case IAVF_VF_ATQBAL1:
+        vf->atq_bal = (uint32_t)val;
+        break;
+    case IAVF_VF_ATQBAH1:
+        vf->atq_bah = (uint32_t)val;
+        break;
+    case IAVF_VF_ATQLEN1:
+        vf->atq_len = (uint32_t)val;
+        fprintf(stderr, "ice-mp-vf%u: ATQLEN1 <- 0x%x (entries=%u enable=%d)\n",
+                vf->vf_number, (unsigned)val,
+                (unsigned)(val & 0x3FF), !!(val & BIT(31)));
+        break;
+    case IAVF_VF_ATQH1:
+        vf->atq_head = (uint32_t)val;
+        break;
+    case IAVF_VF_ATQT1:
+        vf->atq_tail = (uint32_t)val;
+        fprintf(stderr, "ice-mp-vf%u: ATQT1 <- %u (triggering AdminQ processing)\n",
+                vf->vf_number, (unsigned)val);
+        /* Trigger AdminQ command processing */
+        ice_mp_vf_process_atq(vf);
+        break;
+
+    /* AdminQ Receive Queue (ARQ) registers */
+    case IAVF_VF_ARQBAL1:
+        vf->arq_bal = (uint32_t)val;
+        break;
+    case IAVF_VF_ARQBAH1:
+        vf->arq_bah = (uint32_t)val;
+        break;
+    case IAVF_VF_ARQLEN1:
+        vf->arq_len = (uint32_t)val;
+        fprintf(stderr, "ice-mp-vf%u: ARQLEN1 <- 0x%x (entries=%u enable=%d)\n",
+                vf->vf_number, (unsigned)val,
+                (unsigned)(val & 0x3FF), !!(val & BIT(31)));
+        break;
+    case IAVF_VF_ARQH1:
+        vf->arq_head = (uint32_t)val;
+        break;
+    case IAVF_VF_ARQT1:
+        vf->arq_tail = (uint32_t)val;
+        break;
+
+    /* Interrupt registers */
+    case IAVF_VF_VFINT_ICR0_ENA1:
+        vf->vfint_icr0_ena1 = (uint32_t)val;
+        break;
+    case IAVF_VF_VFINT_DYN_CTL01:
+        vf->vfint_dyn_ctl01 = (uint32_t)val;
+        break;
+
+    default:
+        /* TX queue tail registers: 0x0000 + Q*4 */
+        if (addr < IAVF_VF_MAX_QUEUES * 4) {
+            uint32_t q = addr / 4;
+            if (q < IAVF_VF_MAX_QUEUES) {
+                vf->txq[q].tail = (uint16_t)val;
+                /* Process TX queue if enabled */
+                if (vf->txq[q].enabled && vf->pf) {
+                    ice_mp_vf_tx_process(vf, q);
+                }
+            }
+        }
+        /* RX queue tail registers: 0x2000 + Q*4 */
+        else if (addr >= 0x2000 && addr < 0x2000 + IAVF_VF_MAX_QUEUES * 4) {
+            uint32_t q = (addr - 0x2000) / 4;
+            if (q < IAVF_VF_MAX_QUEUES) {
+                vf->rxq[q].tail = (uint16_t)val;
+            }
+        }
+        /* Interrupt throttle: 0x2800 + i*64 + Q*4 */
+        else if (addr >= 0x2800 && addr < 0x2800 + 3 * 64) {
+            uint32_t offset = addr - 0x2800;
+            uint32_t i = offset / 64;
+            uint32_t q = (offset % 64) / 4;
+            if (i < 3 && q < 16) {
+                vf->vfint_itrn[i][q] = (uint32_t)val;
+            }
+        }
+        /* Per-queue dynamic interrupt control: 0x3800 + Q*4 */
+        else if (addr >= 0x3800 && addr < 0x3800 + IAVF_VF_MSIX_VECTORS * 4) {
+            uint32_t q = (addr - 0x3800) / 4;
+            if (q < IAVF_VF_MSIX_VECTORS) {
+                vf->vfint_dyn_ctln[q] = (uint32_t)val;
+            }
+        }
+        /* RSS HENA: 0xC400 + i*4 */
+        else if (addr >= 0xC400 && addr < 0xC400 + 2 * 4) {
+            uint32_t i = (addr - 0xC400) / 4;
+            vf->vfqf_hena[i] = (uint32_t)val;
+        }
+        /* RSS HKEY: 0xCC00 + i*4 */
+        else if (addr >= 0xCC00 && addr < 0xCC00 + 13 * 4) {
+            uint32_t i = (addr - 0xCC00) / 4;
+            vf->vfqf_hkey[i] = (uint32_t)val;
+        }
+        /* RSS HLUT: 0xD000 + i*4 */
+        else if (addr >= 0xD000 && addr < 0xD000 + 16 * 4) {
+            uint32_t i = (addr - 0xD000) / 4;
+            vf->vfqf_hlut[i] = (uint32_t)val;
+        }
+        break;
+    }
 }
+
+/*
+ * VF AdminQ: Write a response descriptor + data to the ARQ ring.
+ * The ARQ ring is managed by the PF (QEMU) as the writer: we write at
+ * arq_head and advance it.  The driver (consumer) reads from its
+ * next_to_clean index and posts consumed buffers back via ARQT1.
+ */
+static void ice_mp_vf_arq_post(ICEMPVFState *vf, uint32_t virtchnl_op,
+                                int32_t virtchnl_status,
+                                const void *payload, uint16_t payload_len)
+{
+    uint32_t arq_entries = vf->arq_len & 0x3FF;
+    uint64_t arq_base = ((uint64_t)vf->arq_bah << 32) | vf->arq_bal;
+    uint32_t head = vf->arq_head;
+    struct iavf_aq_desc resp;
+    PCIDevice *pci = &vf->parent_obj;
+
+    if (!arq_entries || !(vf->arq_len & BIT(31))) {
+        fprintf(stderr, "ice-mp-vf%u: ARQ not enabled, cannot post response\n",
+                vf->vf_number);
+        return;
+    }
+
+    /* Read the existing ARQ descriptor to get the data buffer address */
+    uint64_t desc_addr = arq_base + (uint64_t)head * IAVF_AQ_DESC_SIZE;
+    struct iavf_aq_desc existing;
+    pci_dma_read(pci, desc_addr, &existing, sizeof(existing));
+    uint64_t data_buf = ((uint64_t)le32_to_cpu(existing.addr_high) << 32) |
+                        le32_to_cpu(existing.addr_low);
+
+    /* Build response descriptor */
+    memset(&resp, 0, sizeof(resp));
+    resp.flags = cpu_to_le16(IAVF_AQ_FLAG_DD | IAVF_AQ_FLAG_CMP |
+                             (payload_len ? (IAVF_AQ_FLAG_BUF |
+                              (payload_len > 512 ? IAVF_AQ_FLAG_LB : 0)) : 0));
+    resp.opcode = cpu_to_le16(IAVF_AQ_OPC_SEND_MSG_TO_VF);
+    resp.datalen = cpu_to_le16(payload_len);
+    resp.retval = cpu_to_le16(0);
+    resp.cookie_high = cpu_to_le32(virtchnl_op);
+    resp.cookie_low = cpu_to_le32((uint32_t)virtchnl_status);
+
+    /* Write data buffer payload if present */
+    if (payload && payload_len && data_buf) {
+        resp.addr_high = existing.addr_high;
+        resp.addr_low = existing.addr_low;
+        pci_dma_write(pci, data_buf, payload, payload_len);
+    }
+
+    /* Write response descriptor to ARQ ring */
+    pci_dma_write(pci, desc_addr, &resp, sizeof(resp));
+
+    /* Advance ARQ head */
+    vf->arq_head = (head + 1) % arq_entries;
+
+    fprintf(stderr, "ice-mp-vf%u: ARQ posted op=%u status=%d datalen=%u head=%u->%u\n",
+            vf->vf_number, virtchnl_op, virtchnl_status,
+            payload_len, head, vf->arq_head);
+}
+
+/*
+ * VF AdminQ: Process a single virtchnl message from the ASQ.
+ */
+static void ice_mp_vf_handle_virtchnl(ICEMPVFState *vf, uint32_t v_opcode,
+                                       const uint8_t *msg_buf,
+                                       uint16_t msg_len)
+{
+    fprintf(stderr, "ice-mp-vf%u: virtchnl op=%u datalen=%u\n",
+            vf->vf_number, v_opcode, msg_len);
+
+    switch (v_opcode) {
+    case VIRTCHNL_OP_VERSION: {
+        /* VF sends its version; we reply with PF version */
+        struct {
+            uint32_t major;
+            uint32_t minor;
+        } ver_reply = {
+            .major = cpu_to_le32(1),
+            .minor = cpu_to_le32(1),
+        };
+        vf->version_negotiated = true;
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_VERSION,
+                            VIRTCHNL_STATUS_SUCCESS,
+                            &ver_reply, sizeof(ver_reply));
+        break;
+    }
+
+    case VIRTCHNL_OP_GET_VF_RESOURCES: {
+        /*
+         * Response: virtchnl_vf_resource (20 bytes) + one virtchnl_vsi_resource (16 bytes)
+         * Total = 36 bytes
+         */
+        uint8_t resp_buf[36];
+        memset(resp_buf, 0, sizeof(resp_buf));
+
+        /* Assign VSI ID based on VF number */
+        vf->vsi_id = 100 + vf->vf_number;
+
+        /* virtchnl_vf_resource header (20 bytes) */
+        /* num_vsis (u16) = 1 */
+        resp_buf[0] = 1; resp_buf[1] = 0;
+        /* num_queue_pairs (u16) = IAVF_VF_MAX_QUEUES */
+        resp_buf[2] = IAVF_VF_MAX_QUEUES; resp_buf[3] = 0;
+        /* max_vectors (u16) = IAVF_VF_MSIX_VECTORS */
+        resp_buf[4] = IAVF_VF_MSIX_VECTORS; resp_buf[5] = 0;
+        /* max_mtu (u16) = 9710 */
+        resp_buf[6] = 0xEE; resp_buf[7] = 0x25;
+        /* vf_cap_flags (u32) = L2 | RSS_PF | RX_POLLING */
+        uint32_t caps = VIRTCHNL_VF_OFFLOAD_L2 |
+                        VIRTCHNL_VF_OFFLOAD_RSS_PF |
+                        VIRTCHNL_VF_OFFLOAD_RX_POLLING;
+        memcpy(&resp_buf[8], &caps, 4);
+        /* rss_key_size (u32) = 52 */
+        uint32_t rss_key_size = cpu_to_le32(52);
+        memcpy(&resp_buf[12], &rss_key_size, 4);
+        /* rss_lut_size (u32) = 64 */
+        uint32_t rss_lut_size = cpu_to_le32(64);
+        memcpy(&resp_buf[16], &rss_lut_size, 4);
+
+        /* virtchnl_vsi_resource[0] (16 bytes at offset 20) */
+        /* vsi_id (u16) */
+        uint16_t vsi_id = cpu_to_le16(vf->vsi_id);
+        memcpy(&resp_buf[20], &vsi_id, 2);
+        /* num_queue_pairs (u16) */
+        resp_buf[22] = IAVF_VF_MAX_QUEUES; resp_buf[23] = 0;
+        /* vsi_type (s32) = VIRTCHNL_VSI_SRIOV (6) */
+        int32_t vsi_type = cpu_to_le32(VIRTCHNL_VSI_SRIOV);
+        memcpy(&resp_buf[24], &vsi_type, 4);
+        /* qset_handle (u16) = 0 */
+        resp_buf[28] = 0; resp_buf[29] = 0;
+        /* default_mac_addr[6] */
+        memcpy(&resp_buf[30], vf->mac_addr, 6);
+
+        vf->resources_configured = true;
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_GET_VF_RESOURCES,
+                            VIRTCHNL_STATUS_SUCCESS,
+                            resp_buf, sizeof(resp_buf));
+        fprintf(stderr, "ice-mp-vf%u: GET_VF_RESOURCES reply: vsi=%u queues=%u "
+                "mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                vf->vf_number, vf->vsi_id, IAVF_VF_MAX_QUEUES,
+                vf->mac_addr[0], vf->mac_addr[1], vf->mac_addr[2],
+                vf->mac_addr[3], vf->mac_addr[4], vf->mac_addr[5]);
+        break;
+    }
+
+    case VIRTCHNL_OP_CONFIG_VSI_QUEUES: {
+        /*
+         * Parse queue configuration from the message.
+         * Format: virtchnl_vsi_queue_config_info (8 bytes header)
+         *   u16 vsi_id
+         *   u16 num_queue_pairs
+         *   u32 pad
+         *   virtchnl_queue_pair_info[] qpair (64 bytes each)
+         *     txq_info (24 bytes): vsi_id(2)+queue_id(2)+ring_len(u16@4)+
+         *       headwb_enabled(2)+dma_ring_addr(u64@8)+dma_headwb_addr(8)
+         *     rxq_info (40 bytes): vsi_id(2)+queue_id(2)+ring_len(u32@4)+
+         *       hdr_size(2)+splithdr(2)+databuf_size(4)+max_pkt(4)+
+         *       crc_disable(1)+rxdid(1)+flags(1)+pad(1)+dma_ring_addr(u64@24)+
+         *       rx_split_pos(4)+pad2(4)
+         */
+        if (msg_len >= 8 && msg_buf) {
+            uint16_t num_qps;
+            memcpy(&num_qps, &msg_buf[2], 2);
+            num_qps = le16_to_cpu(num_qps);
+            fprintf(stderr, "ice-mp-vf%u: CONFIG_VSI_QUEUES num_qps=%u\n",
+                    vf->vf_number, num_qps);
+
+            /* Parse each queue pair info (offset 8 onward, 64 bytes each) */
+            size_t offset = 8;
+            for (uint16_t i = 0; i < num_qps && i < IAVF_VF_MAX_QUEUES; i++) {
+                if (offset + 64 > msg_len) break;
+
+                /* TX queue info (24 bytes at offset) */
+                uint16_t txq_ring_len;
+                uint64_t txq_base;
+                memcpy(&txq_ring_len, &msg_buf[offset + 4], 2);  /* u16 ring_len @4 */
+                txq_ring_len = le16_to_cpu(txq_ring_len);
+                memcpy(&txq_base, &msg_buf[offset + 8], 8);      /* u64 dma_ring_addr @8 */
+                txq_base = le64_to_cpu(txq_base);
+                vf->txq[i].base = txq_base;
+                vf->txq[i].qlen = txq_ring_len;
+                vf->txq[i].head = 0;
+                vf->txq[i].port_id = vf->vf_number % (vf->pf ? vf->pf->num_ports : 4);
+
+                /* RX queue info (40 bytes at offset + 24) */
+                uint32_t rxq_ring_len;
+                uint64_t rxq_base;
+                memcpy(&rxq_ring_len, &msg_buf[offset + 24 + 4], 4);  /* u32 ring_len @4 */
+                rxq_ring_len = le32_to_cpu(rxq_ring_len);
+                memcpy(&rxq_base, &msg_buf[offset + 24 + 24], 8);     /* u64 dma_ring_addr @24 */
+                rxq_base = le64_to_cpu(rxq_base);
+                vf->rxq[i].base = rxq_base;
+                vf->rxq[i].qlen = rxq_ring_len;
+                vf->rxq[i].head = 0;
+                vf->rxq[i].port_id = vf->vf_number % (vf->pf ? vf->pf->num_ports : 4);
+
+                fprintf(stderr, "ice-mp-vf%u: Q%u TX base=0x%lx len=%u, RX base=0x%lx len=%u\n",
+                        vf->vf_number, i,
+                        (unsigned long)txq_base, txq_ring_len,
+                        (unsigned long)rxq_base, rxq_ring_len);
+
+                offset += 64;
+            }
+        }
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_CONFIG_VSI_QUEUES,
+                            VIRTCHNL_STATUS_SUCCESS, NULL, 0);
+        break;
+    }
+
+    case VIRTCHNL_OP_CONFIG_IRQ_MAP: {
+        /* Parse IRQ map: map queues to MSI-X vectors.
+         * Format: virtchnl_irq_map_info
+         *   u16 num_vectors
+         *   virtchnl_vector_map[] vecmap
+         *     u16 vsi_id, u16 vector_id, u16 rxq_map, u16 txq_map, u16 rxitr_idx, u16 txitr_idx
+         */
+        if (msg_len >= 2 && msg_buf) {
+            uint16_t num_vectors;
+            memcpy(&num_vectors, &msg_buf[0], 2);
+            num_vectors = le16_to_cpu(num_vectors);
+
+            size_t offset = 2; /* skip num_vectors (u16, no padding) */
+            for (uint16_t v = 0; v < num_vectors; v++) {
+                if (offset + 12 > msg_len) break;
+                uint16_t vector_id;
+                uint16_t rxq_map, txq_map;
+                memcpy(&vector_id, &msg_buf[offset + 2], 2);
+                memcpy(&rxq_map, &msg_buf[offset + 4], 2);
+                memcpy(&txq_map, &msg_buf[offset + 6], 2);
+                vector_id = le16_to_cpu(vector_id);
+                rxq_map = le16_to_cpu(rxq_map);
+                txq_map = le16_to_cpu(txq_map);
+
+                /* Store vector mapping for queue interrupts */
+                for (uint16_t q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+                    if (rxq_map & (1 << q)) {
+                        vf->rxq[q].int_ctl = vector_id | ICE_MP_QINT_CAUSE_ENA_M;
+                    }
+                    if (txq_map & (1 << q)) {
+                        vf->txq[q].int_ctl = vector_id | ICE_MP_QINT_CAUSE_ENA_M;
+                    }
+                }
+
+                fprintf(stderr, "ice-mp-vf%u: IRQ MAP vec=%u rxq_map=0x%x txq_map=0x%x\n",
+                        vf->vf_number, vector_id, rxq_map, txq_map);
+                offset += 12;
+            }
+        }
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_CONFIG_IRQ_MAP,
+                            VIRTCHNL_STATUS_SUCCESS, NULL, 0);
+        break;
+    }
+
+    case VIRTCHNL_OP_ENABLE_QUEUES: {
+        /* Enable TX/RX queues.
+         * Format: virtchnl_queue_select
+         *   u16 vsi_id, u16 pad, u32 rx_queues, u32 tx_queues
+         */
+        if (msg_len >= 12 && msg_buf) {
+            uint32_t rx_queues, tx_queues;
+            memcpy(&rx_queues, &msg_buf[4], 4);
+            memcpy(&tx_queues, &msg_buf[8], 4);
+            rx_queues = le32_to_cpu(rx_queues);
+            tx_queues = le32_to_cpu(tx_queues);
+
+            for (uint32_t q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+                if (tx_queues & (1 << q)) {
+                    vf->txq[q].enabled = true;
+                }
+                if (rx_queues & (1 << q)) {
+                    vf->rxq[q].enabled = true;
+                }
+            }
+            vf->queues_enabled = true;
+            fprintf(stderr, "ice-mp-vf%u: ENABLE_QUEUES rx=0x%x tx=0x%x\n",
+                    vf->vf_number, rx_queues, tx_queues);
+        }
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_ENABLE_QUEUES,
+                            VIRTCHNL_STATUS_SUCCESS, NULL, 0);
+
+        /* Send LINK_CHANGE event so iavf calls netif_carrier_on().
+         * Without this, the driver keeps carrier OFF and blocks all TX.
+         * Format: virtchnl_pf_event (16 bytes)
+         *   s32 event           @ 0  = VIRTCHNL_EVENT_LINK_CHANGE (1)
+         *   u32 link_speed      @ 4  = VIRTCHNL_LINK_SPEED_40GB (4)
+         *   u8  link_status     @ 8  = 1 (UP)
+         *   u8  pad[3]          @ 9  = 0
+         *   s32 severity        @ 12 = 0
+         */
+        {
+            uint8_t link_evt[16];
+            memset(link_evt, 0, sizeof(link_evt));
+            int32_t evt_code = cpu_to_le32(1);  /* LINK_CHANGE */
+            memcpy(&link_evt[0], &evt_code, 4);
+            uint32_t lspeed = cpu_to_le32(4);   /* 40GB */
+            memcpy(&link_evt[4], &lspeed, 4);
+            link_evt[8] = 1;                    /* link UP */
+            ice_mp_vf_arq_post(vf, VIRTCHNL_OP_EVENT, 0,
+                                link_evt, sizeof(link_evt));
+            fprintf(stderr, "ice-mp-vf%u: Posted LINK_CHANGE event (link UP)\n",
+                    vf->vf_number);
+        }
+        break;
+    }
+
+    case VIRTCHNL_OP_DISABLE_QUEUES: {
+        if (msg_len >= 12 && msg_buf) {
+            uint32_t rx_queues, tx_queues;
+            memcpy(&rx_queues, &msg_buf[4], 4);
+            memcpy(&tx_queues, &msg_buf[8], 4);
+            rx_queues = le32_to_cpu(rx_queues);
+            tx_queues = le32_to_cpu(tx_queues);
+
+            for (uint32_t q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+                if (tx_queues & (1 << q)) {
+                    vf->txq[q].enabled = false;
+                }
+                if (rx_queues & (1 << q)) {
+                    vf->rxq[q].enabled = false;
+                }
+            }
+            vf->queues_enabled = false;
+        }
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_DISABLE_QUEUES,
+                            VIRTCHNL_STATUS_SUCCESS, NULL, 0);
+        break;
+    }
+
+    case VIRTCHNL_OP_ADD_ETH_ADDR:
+    case VIRTCHNL_OP_DEL_ETH_ADDR:
+    case VIRTCHNL_OP_ADD_VLAN:
+    case VIRTCHNL_OP_DEL_VLAN:
+    case VIRTCHNL_OP_CONFIG_PROMISCUOUS:
+    case VIRTCHNL_OP_CONFIG_RSS_KEY:
+    case VIRTCHNL_OP_CONFIG_RSS_LUT:
+        /* Accept these silently — no special handling in emulation */
+        ice_mp_vf_arq_post(vf, v_opcode,
+                            VIRTCHNL_STATUS_SUCCESS, NULL, 0);
+        break;
+
+    case VIRTCHNL_OP_GET_STATS: {
+        /* Return all-zero stats (64 bytes) */
+        uint8_t stats[48];
+        memset(stats, 0, sizeof(stats));
+        ice_mp_vf_arq_post(vf, VIRTCHNL_OP_GET_STATS,
+                            VIRTCHNL_STATUS_SUCCESS,
+                            stats, sizeof(stats));
+        break;
+    }
+
+    case VIRTCHNL_OP_GET_OFFLOAD_VLAN_V2:
+    case VIRTCHNL_OP_GET_SUPPORTED_RXDIDS:
+        /* Not supported — tell the driver */
+        ice_mp_vf_arq_post(vf, v_opcode,
+                            VIRTCHNL_STATUS_NOT_SUPPORTED, NULL, 0);
+        break;
+
+    case 2: /* VIRTCHNL_OP_RESET_VF */
+        /*
+         * Reset the VF. The PF does NOT send a virtchnl response.
+         * Instead, the VF polls VFGEN_RSTAT for reset completion.
+         * After reset, RSTAT transitions: INPROGRESS(0) -> ACTIVE(2).
+         * Note: do NOT reset atq_head/arq_head here — the process_atq
+         * loop is still running. The driver will reset them via MMIO
+         * writes (ATQH=0, ARQH=0) during AdminQ re-initialization.
+         */
+        fprintf(stderr, "ice-mp-vf%u: RESET_VF — resetting state\n",
+                vf->vf_number);
+        /* Clear queue state */
+        for (int q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+            vf->txq[q].enabled = false;
+            vf->txq[q].head = 0;
+            vf->txq[q].tail = 0;
+            vf->rxq[q].enabled = false;
+            vf->rxq[q].head = 0;
+            vf->rxq[q].tail = 0;
+        }
+        vf->queues_enabled = false;
+        vf->version_negotiated = false;
+        vf->resources_configured = false;
+        /* Set RSTAT to ACTIVE so the driver can proceed with re-init */
+        vf->vfgen_rstat = 2; /* VIRTCHNL_VFR_VFACTIVE */
+        /* Do NOT send ARQ response for RESET_VF */
+        break;
+
+    default:
+        fprintf(stderr, "ice-mp-vf%u: Unhandled virtchnl op=%u\n",
+                vf->vf_number, v_opcode);
+        ice_mp_vf_arq_post(vf, v_opcode,
+                            VIRTCHNL_STATUS_NOT_SUPPORTED, NULL, 0);
+        break;
+    }
+}
+
+/*
+ * Process pending ASQ descriptors: called when ATQT1 is written.
+ * Reads descriptors from the ASQ ring, processes virtchnl messages,
+ * writes responses to the ARQ ring, and fires AdminQ interrupt.
+ */
+static void ice_mp_vf_process_atq(ICEMPVFState *vf)
+{
+    uint32_t atq_entries = vf->atq_len & 0x3FF;
+    uint64_t atq_base = ((uint64_t)vf->atq_bah << 32) | vf->atq_bal;
+    PCIDevice *pci = &vf->parent_obj;
+
+    if (!atq_entries || !(vf->atq_len & BIT(31))) {
+        return;
+    }
+
+    while (vf->atq_head != vf->atq_tail) {
+        uint64_t desc_addr = atq_base + (uint64_t)vf->atq_head * IAVF_AQ_DESC_SIZE;
+        struct iavf_aq_desc desc;
+
+        pci_dma_read(pci, desc_addr, &desc, sizeof(desc));
+
+        uint16_t opcode = le16_to_cpu(desc.opcode);
+        uint16_t datalen = le16_to_cpu(desc.datalen);
+        uint32_t v_opcode = le32_to_cpu(desc.cookie_high);
+        uint16_t flags = le16_to_cpu(desc.flags);
+
+        fprintf(stderr, "ice-mp-vf%u: ASQ desc head=%u opcode=0x%04x "
+                "v_opcode=%u flags=0x%04x datalen=%u\n",
+                vf->vf_number, vf->atq_head, opcode, v_opcode, flags, datalen);
+
+        /* Read data buffer if present */
+        uint8_t *msg_buf = NULL;
+        uint16_t msg_len = 0;
+        if ((flags & IAVF_AQ_FLAG_BUF) && datalen > 0) {
+            uint64_t data_addr = ((uint64_t)le32_to_cpu(desc.addr_high) << 32) |
+                                 le32_to_cpu(desc.addr_low);
+            if (data_addr) {
+                msg_buf = g_malloc(datalen);
+                pci_dma_read(pci, data_addr, msg_buf, datalen);
+                msg_len = datalen;
+            }
+        } else if (datalen > 0 && datalen <= 16) {
+            /* Inline data in params field (starts at param0, offset 16) */
+            msg_buf = g_malloc(16);
+            memcpy(msg_buf, &desc.param0, 16);
+            msg_len = datalen;
+        }
+
+        /* Process the virtchnl message */
+        if (opcode == IAVF_AQ_OPC_SEND_MSG_TO_PF) {
+            ice_mp_vf_handle_virtchnl(vf, v_opcode, msg_buf, msg_len);
+        }
+
+        /* Mark the ASQ descriptor as completed */
+        desc.flags = cpu_to_le16(flags | IAVF_AQ_FLAG_DD | IAVF_AQ_FLAG_CMP);
+        desc.retval = cpu_to_le16(0);
+        pci_dma_write(pci, desc_addr, &desc, sizeof(desc));
+
+        g_free(msg_buf);
+
+        /* Advance ASQ head */
+        vf->atq_head = (vf->atq_head + 1) % atq_entries;
+    }
+
+    /* Fire AdminQ interrupt (MSI-X vector 0) if enabled */
+    if (msix_enabled(pci) && (vf->vfint_icr0_ena1 & BIT(30))) {
+        vf->vfint_icr01 |= BIT(30);  /* Set AdminQ cause bit */
+        fprintf(stderr, "ice-mp-vf%u: Firing AdminQ MSI-X interrupt (vec 0)\n",
+                vf->vf_number);
+        msix_notify(pci, 0);
+    }
+}
+
+/*
+ * VF TX datapath: Process TX descriptors and generate loopback responses.
+ * Similar to PF TX processing but operates on VF queue state.
+ */
+static void ice_mp_vf_tx_loopback(ICEMPVFState *vf, uint8_t port_id,
+                                   const uint8_t *pkt, size_t len);
+
+static void ice_mp_vf_tx_process(ICEMPVFState *vf, uint16_t qid)
+{
+    if (qid >= IAVF_VF_MAX_QUEUES || !vf->pf) {
+        return;
+    }
+
+    ICEMPVFQueue *q = &vf->txq[qid];
+    uint16_t ring_size = q->qlen ? q->qlen : 256;
+    uint16_t head = q->head;
+    uint16_t tail = q->tail;
+    PCIDevice *pci = &vf->parent_obj;
+    ICEMPState *pf = vf->pf;
+
+    if (!q->enabled || ring_size == 0 || head == tail) {
+        return;
+    }
+
+    fprintf(stderr, "ice-mp-vf%u: TX processing qid=%u head=%u tail=%u\n",
+            vf->vf_number, qid, head, tail);
+
+    GByteArray *tx_pkt = g_byte_array_new();
+
+    while (head != tail) {
+        uint64_t desc_addr = q->base + ((uint64_t)head * ICE_MP_TX_DESC_SIZE);
+        struct ice_mp_tx_desc desc;
+        uint64_t qw1;
+        uint16_t cmd;
+
+        pci_dma_read(pci, desc_addr, &desc, sizeof(desc));
+        qw1 = le64_to_cpu(desc.cmd_type_offset_bsz);
+        cmd = (qw1 >> ICE_MP_TXD_QW1_CMD_S) & 0xFFF;
+        uint8_t dtype = qw1 & 0xFULL;
+
+        if (dtype == ICE_TX_DESC_DTYPE_CTX) {
+            head = (head + 1) % ring_size;
+            continue;
+        }
+
+        if (dtype == ICE_TX_DESC_DTYPE_DATA) {
+            uint16_t len = (uint16_t)((qw1 >> ICE_MP_TXD_QW1_TX_BUF_SZ_S) & 0x3FFF);
+
+            if (len) {
+                uint8_t *buf = g_malloc(len);
+                pci_dma_read(pci, le64_to_cpu(desc.buf_addr), buf, len);
+                g_byte_array_append(tx_pkt, buf, len);
+                g_free(buf);
+            }
+
+            if (cmd & ICE_TX_DESC_CMD_EOP) {
+                if (tx_pkt->len) {
+                    /* Send packet to the network backend (same port as PF) */
+                    uint8_t port_id = q->port_id;
+                    if (port_id < pf->num_ports && pf->nic[port_id]) {
+                        NetClientState *nc = qemu_get_queue(pf->nic[port_id]);
+                        qemu_send_packet(nc, tx_pkt->data, tx_pkt->len);
+                    }
+                    /* Generate loopback responses */
+                    ice_mp_vf_tx_loopback(vf, q->port_id, tx_pkt->data, tx_pkt->len);
+                }
+
+                /* Write back descriptor done */
+                desc.cmd_type_offset_bsz =
+                    cpu_to_le64((qw1 & ~0xFULL) | ICE_TX_DESC_DTYPE_DESC_DONE);
+                uint64_t wb_addr = desc_addr +
+                    offsetof(struct ice_mp_tx_desc, cmd_type_offset_bsz);
+                pci_dma_write(pci, wb_addr,
+                              &desc.cmd_type_offset_bsz,
+                              sizeof(desc.cmd_type_offset_bsz));
+
+                /* Fire TX completion interrupt */
+                if (msix_enabled(pci) && (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M)) {
+                    uint16_t msix_idx = q->int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+                    if (msix_idx < IAVF_VF_MSIX_VECTORS) {
+                        msix_notify(pci, msix_idx);
+                    }
+                }
+
+                g_byte_array_set_size(tx_pkt, 0);
+            }
+        }
+
+        head = (head + 1) % ring_size;
+    }
+
+    q->head = head;
+    g_byte_array_free(tx_pkt, true);
+}
+
+/*
+ * VF RX datapath: Enqueue a received packet into VF RX ring.
+ */
+static bool ice_mp_vf_rx_enqueue(ICEMPVFState *vf, uint16_t qid,
+                                  const uint8_t *buf, size_t size)
+{
+    if (qid >= IAVF_VF_MAX_QUEUES) {
+        return false;
+    }
+
+    ICEMPVFQueue *q = &vf->rxq[qid];
+    uint16_t ring_size = q->qlen ? q->qlen : 256;
+    PCIDevice *pci = &vf->parent_obj;
+
+    if (!q->enabled || ring_size == 0 || q->head == q->tail) {
+        return false;
+    }
+
+    /* Write packet data to RX descriptor buffer */
+    uint64_t desc_addr = q->base + ((uint64_t)q->head * ICE_MP_RX_DESC_SIZE);
+    union ice_mp_rx_desc desc;
+
+    pci_dma_read(pci, desc_addr, &desc, sizeof(desc));
+
+    if (!desc.read.pkt_addr) {
+        return false;
+    }
+
+    uint32_t copy_len = (size > 2048) ? 2048 : (uint32_t)size;
+    pci_dma_write(pci, le64_to_cpu(desc.read.pkt_addr), buf, copy_len);
+
+    /* Write back RX descriptor in legacy i40e format (RXDID=1).
+     * The iavf driver uses legacy 32-byte descriptors when the PF
+     * does not advertise flex descriptor support (GET_SUPPORTED_RXDIDS).
+     * Legacy format:
+     *   QW0 (bytes 0-7):  RSS hash [63:32], L2TAG1 [33:16], mirror [15:0]
+     *   QW1 (bytes 8-15): hdr_len [63:52], pkt_len [51:38], SPH [37:36],
+     *                     htype [35:32], error [31:19], status [18:0]
+     *                     DD=bit0, EOP=bit1
+     */
+    memset(&desc, 0, sizeof(desc));
+    desc.read.pkt_addr = 0;  /* QW0: no RSS/L2TAG */
+    uint64_t qw1 = ((uint64_t)copy_len << 38) | 0x3; /* DD=1, EOP=1 */
+    desc.read.hdr_addr = cpu_to_le64(qw1);  /* QW1 at offset 8 */
+
+    pci_dma_write(pci, desc_addr, &desc, sizeof(desc));
+
+    q->head = (q->head + 1) % ring_size;
+
+    /* Fire RX interrupt */
+    if (msix_enabled(pci) && (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M)) {
+        uint16_t msix_idx = q->int_ctl & ICE_MP_QINT_MSIX_INDX_M;
+        if (msix_idx < IAVF_VF_MSIX_VECTORS) {
+            msix_notify(pci, msix_idx);
+        }
+    }
+
+    return true;
+}
+
+/*
+ * VF TX loopback: Generate ARP replies and ICMP echo replies
+ * so that ping works through VF interfaces.
+ */
+static void ice_mp_vf_tx_loopback(ICEMPVFState *vf, uint8_t port_id,
+                                   const uint8_t *pkt_data, size_t len)
+{
+    if (len < 14) {
+        return;
+    }
+
+    uint16_t ethertype = (pkt_data[12] << 8) | pkt_data[13];
+
+    /* Handle ARP requests */
+    if (ethertype == 0x0806 && len >= 42) {
+        uint16_t oper = (pkt_data[20] << 8) | pkt_data[21];
+        if (oper == 1) {  /* ARP Request */
+            uint8_t reply[42];
+            /* Use a unique peer MAC per VF: 52:54:00:vf:PP:QQ */
+            uint8_t peer_mac[6] = {0x52, 0x54, 0x00, 0xaa,
+                                   (uint8_t)(vf->vf_number + 0x10), port_id};
+
+            memcpy(&reply[0], &pkt_data[6], 6);
+            memcpy(&reply[6], peer_mac, 6);
+            reply[12] = 0x08; reply[13] = 0x06;
+            reply[14] = 0x00; reply[15] = 0x01;
+            reply[16] = 0x08; reply[17] = 0x00;
+            reply[18] = 6; reply[19] = 4;
+            reply[20] = 0x00; reply[21] = 0x02;
+            memcpy(&reply[22], peer_mac, 6);
+            memcpy(&reply[28], &pkt_data[38], 4);
+            memcpy(&reply[32], &pkt_data[6], 6);
+            memcpy(&reply[38], &pkt_data[28], 4);
+
+            fprintf(stderr, "ice-mp-vf%u: Loopback ARP reply port=%u target=%u.%u.%u.%u\n",
+                    vf->vf_number, port_id,
+                    pkt_data[38], pkt_data[39], pkt_data[40], pkt_data[41]);
+
+            /* Try to enqueue on first enabled RX queue */
+            for (uint16_t q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+                if (vf->rxq[q].enabled) {
+                    ice_mp_vf_rx_enqueue(vf, q, reply, 42);
+                    break;
+                }
+            }
+        }
+    }
+    /* Handle ICMP echo requests */
+    else if (ethertype == 0x0800 && len >= 34) {
+        uint8_t ihl = (pkt_data[14] & 0x0F) * 4;
+        uint8_t proto = pkt_data[23];
+        size_t icmp_off = 14 + ihl;
+
+        if (proto == 1 && len >= icmp_off + 8) {
+            uint8_t icmp_type = pkt_data[icmp_off];
+            if (icmp_type == 8) {  /* Echo Request */
+                uint8_t *reply = g_malloc(len);
+                memcpy(reply, pkt_data, len);
+
+                uint8_t peer_mac[6] = {0x52, 0x54, 0x00, 0xaa,
+                                       (uint8_t)(vf->vf_number + 0x10), port_id};
+
+                /* Swap MACs */
+                memcpy(&reply[0], &pkt_data[6], 6);
+                memcpy(&reply[6], peer_mac, 6);
+                /* Swap IPs */
+                memcpy(&reply[26], &pkt_data[30], 4);
+                memcpy(&reply[30], &pkt_data[26], 4);
+                /* Set TTL */
+                reply[22] = 64;
+
+                /* Recalculate IP header checksum */
+                reply[24] = 0; reply[25] = 0;
+                uint32_t ip_sum = 0;
+                for (int i = 14; i < 14 + ihl; i += 2) {
+                    ip_sum += (reply[i] << 8) | reply[i + 1];
+                }
+                while (ip_sum >> 16) {
+                    ip_sum = (ip_sum & 0xFFFF) + (ip_sum >> 16);
+                }
+                uint16_t ip_cksum = ~ip_sum & 0xFFFF;
+                reply[24] = ip_cksum >> 8;
+                reply[25] = ip_cksum & 0xFF;
+
+                /* ICMP echo reply */
+                reply[icmp_off] = 0;
+                reply[icmp_off + 2] = 0; reply[icmp_off + 3] = 0;
+                uint32_t icmp_sum = 0;
+                size_t icmp_len = len - icmp_off;
+                for (size_t i = 0; i < icmp_len; i += 2) {
+                    uint16_t word = reply[icmp_off + i] << 8;
+                    if (i + 1 < icmp_len) {
+                        word |= reply[icmp_off + i + 1];
+                    }
+                    icmp_sum += word;
+                }
+                while (icmp_sum >> 16) {
+                    icmp_sum = (icmp_sum & 0xFFFF) + (icmp_sum >> 16);
+                }
+                uint16_t icmp_cksum = ~icmp_sum & 0xFFFF;
+                reply[icmp_off + 2] = icmp_cksum >> 8;
+                reply[icmp_off + 3] = icmp_cksum & 0xFF;
+
+                fprintf(stderr, "ice-mp-vf%u: Loopback ICMP reply port=%u len=%zu\n",
+                        vf->vf_number, port_id, len);
+
+                for (uint16_t q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+                    if (vf->rxq[q].enabled) {
+                        ice_mp_vf_rx_enqueue(vf, q, reply, len);
+                        break;
+                    }
+                }
+                g_free(reply);
+            }
+        }
+    }
+}
+
+static const MemoryRegionOps ice_mp_vf_mmio_ops = {
+    .read = ice_mp_vf_mmio_read,
+    .write = ice_mp_vf_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
 
 static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
 {
     ICEMPVFState *vf = ICE_MP_VF(pci_dev);
     uint8_t *pci_conf = pci_dev->config;
-    static const MemoryRegionOps vf_mmio_ops = {
-        .read = ice_mp_vf_mmio_read,
-        .write = ice_mp_vf_mmio_write,
-        .endianness = DEVICE_LITTLE_ENDIAN,
-        .impl = {
-            .min_access_size = 4,
-            .max_access_size = 4,
-        },
-    };
+    int ret;
 
-    /* Initialize PCI config space for VF immediately */
+    /* Initialize PCI config space for VF */
     pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_INTEL);
     pci_config_set_device_id(pci_conf, ICE_MP_VF_DEV_ID);
     pci_config_set_class(pci_conf, PCI_CLASS_NETWORK_ETHERNET);
     pci_config_set_revision(pci_conf, 0x01);
-    
+
     /* Enable memory space access */
     pci_set_word(pci_conf + PCI_COMMAND, PCI_COMMAND_MEMORY);
-    
-    fprintf(stderr, "ice-mp-vf: realize() - devfn=0x%x, vendor=0x%04x, device=0x%04x, cmd=0x%04x\n",
-            pci_dev->devfn,
-            pci_get_word(pci_conf + PCI_VENDOR_ID),
-            pci_get_word(pci_conf + PCI_DEVICE_ID),
-            pci_get_word(pci_conf + PCI_COMMAND));
+
+    /* Find parent PF device */
+    PCIDevice *pf_dev = pcie_sriov_get_pf(pci_dev);
+    if (pf_dev) {
+        vf->pf = ICE_MP(pf_dev);
+        vf->vf_number = pcie_sriov_vf_number(pci_dev);
+    }
+
+    fprintf(stderr, "ice-mp-vf: realize() - vf_number=%u devfn=0x%x pf=%p\n",
+            vf->vf_number, pci_dev->devfn, vf->pf);
 
     if (pcie_endpoint_cap_init(pci_dev, 0x80) < 0) {
         error_setg(errp, "Failed to initialize PCIe capability (VF)");
         return;
     }
 
-    memory_region_init_io(&vf->bar0, OBJECT(vf), &vf_mmio_ops, vf,
-                         "ice-mp-vf-mmio", 0x1000);
+    /* Initialize MSI-X for VF (needed for AdminQ and queue interrupts) */
+    memory_region_init(&vf->msix_bar, OBJECT(vf), "ice-mp-vf-msix", 0x4000);
+    pcie_sriov_vf_register_bar(pci_dev, 3, &vf->msix_bar);
+
+    ret = msix_init(pci_dev, IAVF_VF_MSIX_VECTORS,
+                    &vf->msix_bar, 3, 0,
+                    &vf->msix_bar, 3, 0x1000,
+                    0x70, errp);
+    if (ret < 0) {
+        error_setg(errp, "Failed to initialize MSI-X for VF%u", vf->vf_number);
+        return;
+    }
+
+    /* Mark all MSI-X vectors as used */
+    for (int i = 0; i < IAVF_VF_MSIX_VECTORS; i++) {
+        msix_vector_use(pci_dev, i);
+    }
+
+    /* Initialize BAR0 for VF MMIO registers */
+    memory_region_init_io(&vf->bar0, OBJECT(vf), &ice_mp_vf_mmio_ops, vf,
+                         "ice-mp-vf-mmio", IAVF_VF_BAR0_SIZE);
     pcie_sriov_vf_register_bar(pci_dev, 0, &vf->bar0);
+
+    /* Initialize VF state */
+    vf->vfgen_rstat = 2;  /* VFACTIVE - VF is ready */
+    vf->version_negotiated = false;
+    vf->resources_configured = false;
+    vf->queues_enabled = false;
+
+    /* Assign a unique MAC address per VF: 52:54:00:12:VF:00 */
+    vf->mac_addr[0] = 0x52;
+    vf->mac_addr[1] = 0x54;
+    vf->mac_addr[2] = 0x00;
+    vf->mac_addr[3] = 0x12;
+    vf->mac_addr[4] = vf->vf_number + 1;
+    vf->mac_addr[5] = 0x00;
+
+    /* Zero out all queue state */
+    memset(vf->txq, 0, sizeof(vf->txq));
+    memset(vf->rxq, 0, sizeof(vf->rxq));
+
+    fprintf(stderr, "ice-mp-vf%u: realized, RSTAT=%u, MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            vf->vf_number, vf->vfgen_rstat,
+            vf->mac_addr[0], vf->mac_addr[1], vf->mac_addr[2],
+            vf->mac_addr[3], vf->mac_addr[4], vf->mac_addr[5]);
 }
 
 static void ice_mp_vf_class_init(ObjectClass *klass, void *data)

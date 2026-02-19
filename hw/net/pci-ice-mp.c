@@ -167,7 +167,10 @@
 /* Maximum ports and VFs */
 #define ICE_MP_MAX_PORTS        16
 #define ICE_MP_MAX_VFS          256
-#define ICE_MP_MSIX_VECTORS     64  /* Enough for 4 ports * num_cpus + OICR + control VSI */
+#define ICE_MP_MSIX_VECTORS     1024 /* Ensure enough vectors remain for SR-IOV (2/VF) after PF reservations */
+#define ICE_MP_MSIX_BAR_SIZE    0x8000
+#define ICE_MP_MSIX_TABLE_OFFSET 0x0000
+#define ICE_MP_MSIX_PBA_OFFSET  0x4000
 
 /* FW logging module count (LIBIE_AQC_FW_LOG_ID_MAX) */
 #define ICE_MP_FWLOG_MODULES    32
@@ -594,6 +597,9 @@ struct ice_mp_aqc_manage_mac_read_resp {
 static void ice_mp_adminq_complete(struct ICEMPState *s, struct ice_mp_aq_desc *desc);
 static void ice_mp_adminq_add_tx_queues(struct ICEMPState *s, struct ice_mp_aq_desc *desc);
 static void ice_mp_mailbox_process(struct ICEMPState *s);
+static void ice_mp_notify_vfs_link_change(struct ICEMPState *s,
+                                          uint8_t port_id,
+                                          bool link_up);
 
 static uint64_t ice_mp_dma_addr(uint32_t low, uint32_t high)
 {
@@ -1335,10 +1341,15 @@ static void ice_mp_link_status_changed(NetClientState *nc)
     ICEMPState *s = port->s;
     uint8_t port_id = port->port_id;
     bool link_up = !nc->link_down;
+    uint32_t old_status;
+    bool link_changed;
 
     if (port_id >= s->num_ports) {
         return;
     }
+
+    old_status = s->port_status[port_id];
+    link_changed = ((old_status & ICE_MP_PORT_LINK_UP) != 0) != link_up;
 
     fprintf(stderr, "ice-mp: link_status_changed port=%u link_up=%d\n",
             port_id, link_up);
@@ -1357,6 +1368,10 @@ static void ice_mp_link_status_changed(NetClientState *nc)
             !msix_is_masked(&s->parent_obj, 0)) {
             msix_notify(&s->parent_obj, 0);
         }
+    }
+
+    if (link_changed) {
+        ice_mp_notify_vfs_link_change(s, port_id, link_up);
     }
 }
 
@@ -1382,6 +1397,7 @@ static bool ice_mp_mac_is_zero(const MACAddr *mac)
 static void ice_mp_init_nics(ICEMPState *s, PCIDevice *pdev)
 {
     DeviceState *dev = DEVICE(pdev);
+    uint8_t mac_bias = (uint8_t)(pci_dev_bus_num(pdev) & 0x3f);
 
     for (uint32_t i = 0; i < s->num_ports; i++) {
         char *name;
@@ -1394,6 +1410,10 @@ static void ice_mp_init_nics(ICEMPState *s, PCIDevice *pdev)
         } else if (ice_mp_mac_is_zero(&s->conf[i].macaddr)) {
             s->conf[i].macaddr = s->conf[0].macaddr;
             s->conf[i].macaddr.a[5] += (uint8_t)i;
+        }
+
+        if (mac_bias) {
+            s->conf[i].macaddr.a[4] += mac_bias;
         }
 
         name = g_strdup_printf("%s-port%u", dev->id ? dev->id : "ice-mp", i);
@@ -1943,6 +1963,10 @@ static void ice_mp_adminq_set_phy_cfg(struct ICEMPState *s, struct ice_mp_aq_des
         msix_notify(&s->parent_obj, 0);  /* Vector 0 = OICR */
         fprintf(stderr, "ice-mp: Sending link change interrupt for port %u\n", port_num);
     }
+
+    if (link_changed) {
+        ice_mp_notify_vfs_link_change(s, port_num, (phy_cfg.caps & 0x01) != 0);
+    }
     
     ice_mp_adminq_complete(s, desc);
 }
@@ -2146,16 +2170,19 @@ static void ice_mp_adminq_get_port_options(struct ICEMPState *s, struct ice_mp_a
         uint8_t global_scid[2];
         uint8_t phy_scid[2];
         uint8_t pf2port_cid[2];
-    } __attribute__((packed)) port_opt_elems[4];
+    } __attribute__((packed)) port_opt_elems[ICE_MP_MAX_PORTS];
     
     uint64_t addr;
     int num_ports = s->num_ports > 0 ? s->num_ports : 4;
     int i;
+
+    if (num_ports > ICE_MP_MAX_PORTS)
+        num_ports = ICE_MP_MAX_PORTS;
     
     memset(port_opt_elems, 0, sizeof(port_opt_elems));
     
     /* Return port options for each port */
-    for (i = 0; i < num_ports && i < 4; i++) {
+    for (i = 0; i < num_ports; i++) {
         port_opt_elems[i].pmd = 1;       /* 1 PMD module per port */
         port_opt_elems[i].max_lane_speed = 5;  /* 25G max speed */
     }
@@ -2213,20 +2240,20 @@ static void ice_mp_adminq_list_caps(struct ICEMPState *s, struct ice_mp_aq_desc 
 
     /* VSI */
     elems[count].cap = cpu_to_le16(0x0017);
-    elems[count].number = cpu_to_le32(64);
+        elems[count].number = cpu_to_le32(ICE_MP_MAX_VSI);
     fprintf(stderr, "ice-mp: Setting VSI capability - cap=0x%04x, number=%u (index %d)\n",
-            0x0017, 64, count);
+            0x0017, ICE_MP_MAX_VSI, count);
     count++;
 
     /* RXQS */
     elems[count].cap = cpu_to_le16(0x0041);
-    elems[count].number = cpu_to_le32(64);
+        elems[count].number = cpu_to_le32(ICE_MP_MAX_RX_QUEUES);
     elems[count].phys_id = cpu_to_le32(0);
     count++;
 
     /* TXQS */
     elems[count].cap = cpu_to_le16(0x0042);
-    elems[count].number = cpu_to_le32(64);
+        elems[count].number = cpu_to_le32(ICE_MP_MAX_TX_QUEUES);
     elems[count].phys_id = cpu_to_le32(0);
     count++;
 
@@ -2249,7 +2276,7 @@ static void ice_mp_adminq_list_caps(struct ICEMPState *s, struct ice_mp_aq_desc 
     desc->datalen = cpu_to_le16(count * sizeof(elems[0]));
         fprintf(stderr, "ice-mp: List %s caps count=%d addr=0x%lx msix=%u rxq=%u txq=%u\n",
             is_dev_caps ? "dev" : "func", count, (unsigned long)addr,
-            ICE_MP_MSIX_VECTORS, 64u, 64u);
+            ICE_MP_MSIX_VECTORS, ICE_MP_MAX_RX_QUEUES, ICE_MP_MAX_TX_QUEUES);
 
     ice_mp_adminq_complete(s, desc);
 }
@@ -3536,8 +3563,8 @@ struct iavf_aq_desc {
 #define VIRTCHNL_VSI_SRIOV               6
 
 /* VF TX/RX queue limits */
-#define IAVF_VF_MAX_QUEUES               4
-#define IAVF_VF_MSIX_VECTORS             5  /* 4 queue vectors + 1 AdminQ */
+#define IAVF_VF_MAX_QUEUES               1
+#define IAVF_VF_MSIX_VECTORS             2  /* 1 queue vector + 1 AdminQ */
 
 typedef struct ICEMPVFQueue {
     uint64_t base;          /* Ring base DMA address */
@@ -4308,12 +4335,12 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Initialize BAR1 for MSI-X */
     s->msix_bar_idx = 1;
-    memory_region_init(&s->bar1, OBJECT(s), "ice-mp-msix", 0x4000);
+    memory_region_init(&s->bar1, OBJECT(s), "ice-mp-msix", ICE_MP_MSIX_BAR_SIZE);
     pci_register_bar(pci_dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar1);
     
     ret = msix_init(pci_dev, ICE_MP_MSIX_VECTORS,
-                    &s->bar1, s->msix_bar_idx, 0,
-                    &s->bar1, s->msix_bar_idx, 0x1000,
+                    &s->bar1, s->msix_bar_idx, ICE_MP_MSIX_TABLE_OFFSET,
+                    &s->bar1, s->msix_bar_idx, ICE_MP_MSIX_PBA_OFFSET,
                     0x70, errp);
     if (ret < 0) {
         return;
@@ -4342,11 +4369,11 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
         pcie_sriov_pf_init(pci_dev, ICE_MP_SRIOV_OFFSET, "pci-ice-mp-vf",
                   ICE_MP_VF_DEV_ID, init_vfs, s->num_vfs,
                   ICE_MP_VF_OFFSET, ICE_MP_VF_STRIDE);
-        pcie_sriov_pf_init_vf_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY,
+        pcie_sriov_pf_init_vf_bar(pci_dev, 0,
+                      PCI_BASE_ADDRESS_SPACE_MEMORY |
+                      PCI_BASE_ADDRESS_MEM_TYPE_64 |
+                      PCI_BASE_ADDRESS_MEM_PREFETCH,
                                   IAVF_VF_BAR0_SIZE);
-        /* VF BAR 3 for MSI-X table/PBA */
-        pcie_sriov_pf_init_vf_bar(pci_dev, 3, PCI_BASE_ADDRESS_SPACE_MEMORY,
-                                  0x4000);
         fprintf(stderr,
             "ice-mp: SR-IOV cfg vf_offset=0x%x vf_stride=0x%x sup_pg=0x%x sys_pg=0x%x\n",
             pci_get_word(pci_conf + ICE_MP_SRIOV_OFFSET + PCI_SRIOV_VF_OFFSET),
@@ -4607,10 +4634,18 @@ static Property ice_mp_properties[] = {
     DEFINE_PROP_NETDEV("netdev1", ICEMPState, conf[1].peers),
     DEFINE_PROP_NETDEV("netdev2", ICEMPState, conf[2].peers),
     DEFINE_PROP_NETDEV("netdev3", ICEMPState, conf[3].peers),
+    DEFINE_PROP_NETDEV("netdev4", ICEMPState, conf[4].peers),
+    DEFINE_PROP_NETDEV("netdev5", ICEMPState, conf[5].peers),
+    DEFINE_PROP_NETDEV("netdev6", ICEMPState, conf[6].peers),
+    DEFINE_PROP_NETDEV("netdev7", ICEMPState, conf[7].peers),
     DEFINE_PROP_MACADDR("mac0", ICEMPState, conf[0].macaddr),
     DEFINE_PROP_MACADDR("mac1", ICEMPState, conf[1].macaddr),
     DEFINE_PROP_MACADDR("mac2", ICEMPState, conf[2].macaddr),
     DEFINE_PROP_MACADDR("mac3", ICEMPState, conf[3].macaddr),
+    DEFINE_PROP_MACADDR("mac4", ICEMPState, conf[4].macaddr),
+    DEFINE_PROP_MACADDR("mac5", ICEMPState, conf[5].macaddr),
+    DEFINE_PROP_MACADDR("mac6", ICEMPState, conf[6].macaddr),
+    DEFINE_PROP_MACADDR("mac7", ICEMPState, conf[7].macaddr),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -4914,6 +4949,64 @@ static void ice_mp_vf_arq_post(ICEMPVFState *vf, uint32_t virtchnl_op,
     fprintf(stderr, "ice-mp-vf%u: ARQ posted op=%u status=%d datalen=%u head=%u->%u\n",
             vf->vf_number, virtchnl_op, virtchnl_status,
             payload_len, head, vf->arq_head);
+}
+
+static void ice_mp_vf_post_link_change_event(ICEMPVFState *vf, bool link_up)
+{
+    uint8_t link_evt[16];
+    int32_t evt_code = cpu_to_le32(1);   /* VIRTCHNL_EVENT_LINK_CHANGE */
+    uint32_t lspeed = cpu_to_le32(link_up ? 4 : 0); /* 40G when up, 0 when down */
+
+    if (!vf->queues_enabled || !vf->resources_configured) {
+        return;
+    }
+
+    memset(link_evt, 0, sizeof(link_evt));
+    memcpy(&link_evt[0], &evt_code, sizeof(evt_code));
+    memcpy(&link_evt[4], &lspeed, sizeof(lspeed));
+    link_evt[8] = link_up ? 1 : 0;
+
+    ice_mp_vf_arq_post(vf, VIRTCHNL_OP_EVENT, 0, link_evt, sizeof(link_evt));
+    fprintf(stderr, "ice-mp-vf%u: Posted LINK_CHANGE event (link %s)\n",
+            vf->vf_number, link_up ? "UP" : "DOWN");
+}
+
+static void ice_mp_notify_vfs_link_change(ICEMPState *s, uint8_t port_id, bool link_up)
+{
+    PCIDevice *pf = &s->parent_obj;
+    uint16_t num_vfs = pf->exp.sriov_pf.num_vfs;
+    uint16_t notified = 0;
+
+    if (!pf->exp.sriov_pf.vf || !num_vfs) {
+        return;
+    }
+
+    for (uint16_t i = 0; i < num_vfs; i++) {
+        PCIDevice *vf_pci = pf->exp.sriov_pf.vf[i];
+        ICEMPVFState *vf;
+        uint16_t vf_id;
+
+        if (!vf_pci) {
+            continue;
+        }
+
+        vf = ICE_MP_VF(vf_pci);
+        vf_id = vf->vf_number;
+        if (vf_id >= ICE_MP_MAX_VFS) {
+            continue;
+        }
+
+        if (s->vf_port_map[vf_id] != port_id) {
+            continue;
+        }
+
+        ice_mp_vf_post_link_change_event(vf, link_up);
+        notified++;
+    }
+
+    fprintf(stderr,
+            "ice-mp: Propagated PF port %u link %s to %u mapped VFs\n",
+            port_id, link_up ? "UP" : "DOWN", notified);
 }
 
 /*
@@ -5610,7 +5703,6 @@ static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
 {
     ICEMPVFState *vf = ICE_MP_VF(pci_dev);
     uint8_t *pci_conf = pci_dev->config;
-    int ret;
 
     /* Initialize PCI config space for VF */
     pci_config_set_vendor_id(pci_conf, PCI_VENDOR_ID_INTEL);
@@ -5634,24 +5726,6 @@ static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
     if (pcie_endpoint_cap_init(pci_dev, 0x80) < 0) {
         error_setg(errp, "Failed to initialize PCIe capability (VF)");
         return;
-    }
-
-    /* Initialize MSI-X for VF (needed for AdminQ and queue interrupts) */
-    memory_region_init(&vf->msix_bar, OBJECT(vf), "ice-mp-vf-msix", 0x4000);
-    pcie_sriov_vf_register_bar(pci_dev, 3, &vf->msix_bar);
-
-    ret = msix_init(pci_dev, IAVF_VF_MSIX_VECTORS,
-                    &vf->msix_bar, 3, 0,
-                    &vf->msix_bar, 3, 0x1000,
-                    0x70, errp);
-    if (ret < 0) {
-        error_setg(errp, "Failed to initialize MSI-X for VF%u", vf->vf_number);
-        return;
-    }
-
-    /* Mark all MSI-X vectors as used */
-    for (int i = 0; i < IAVF_VF_MSIX_VECTORS; i++) {
-        msix_vector_use(pci_dev, i);
     }
 
     /* Initialize BAR0 for VF MMIO registers */

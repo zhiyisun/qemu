@@ -166,6 +166,7 @@ static PCIDevice *register_vf(PCIDevice *pf, int devfn, const char *name,
 static void register_vfs(PCIDevice *dev)
 {
     uint16_t num_vfs;
+    uint16_t requested_vfs;
     uint16_t i;
     uint16_t sriov_cap = dev->exp.sriov_cap;
     uint16_t vf_offset =
@@ -173,11 +174,35 @@ static void register_vfs(PCIDevice *dev)
     uint16_t vf_stride =
         pci_get_word(dev->config + sriov_cap + PCI_SRIOV_VF_STRIDE);
     int32_t devfn = dev->devfn + vf_offset;
+    int32_t last_devfn;
+    uint16_t capped_vfs;
 
     assert(sriov_cap > 0);
     num_vfs = pci_get_word(dev->config + sriov_cap + PCI_SRIOV_NUM_VF);
+    requested_vfs = num_vfs;
     if (num_vfs > pci_get_word(dev->config + sriov_cap + PCI_SRIOV_TOTAL_VF)) {
         return;
+    }
+
+    if (!vf_stride) {
+        error_report("SR-IOV: %s invalid VF stride=0", dev->name);
+        return;
+    }
+
+    if (devfn > 0xff) {
+        error_report("SR-IOV: %s VF offset maps outside devfn range (start=%d)",
+                     dev->name, devfn);
+        return;
+    }
+
+    last_devfn = devfn + (int32_t)(num_vfs - 1) * vf_stride;
+    if (num_vfs && last_devfn > 0xff) {
+        capped_vfs = (uint16_t)(((0xff - devfn) / vf_stride) + 1);
+        error_report("SR-IOV: %s requested %u VFs but only %u fit devfn range"
+                     " (start=%d stride=%u); capping to %u",
+                     dev->name, requested_vfs, capped_vfs,
+                     devfn, vf_stride, capped_vfs);
+        num_vfs = capped_vfs;
     }
 
     error_report("SR-IOV: enabling %u VFs for %s", num_vfs, dev->name);
@@ -197,6 +222,11 @@ static void register_vfs(PCIDevice *dev)
         devfn += vf_stride;
     }
     dev->exp.sriov_pf.num_vfs = num_vfs;
+
+    if (requested_vfs != num_vfs) {
+        error_report("SR-IOV: %s requested %u VFs, realized %u VFs",
+                     dev->name, requested_vfs, num_vfs);
+    }
 }
 
 static void unregister_vfs(PCIDevice *dev)

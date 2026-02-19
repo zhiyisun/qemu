@@ -348,6 +348,7 @@ struct ICEMPState {
     uint32_t num_vfs;
     uint32_t rxq_map_mode;
     uint32_t queues_per_port;
+    bool loopback_enable;
     
     /* BAR0 Registers */
     uint32_t caps;
@@ -1136,8 +1137,10 @@ static void ice_mp_tx_process_queue(struct ICEMPState *s, uint16_t qid)
                     fprintf(stderr, "ice-mp: Sending packet qid=%u port=%u len=%u\n",
                             qid, q->port_id, pkt->len);
                     qemu_send_packet(nc, pkt->data, pkt->len);
-                    /* Generate loopback ARP/ICMP responses for datapath */
-                    ice_mp_tx_loopback(s, q->port_id, pkt->data, pkt->len);
+                    if (s->loopback_enable) {
+                        /* Generate loopback ARP/ICMP responses for datapath */
+                        ice_mp_tx_loopback(s, q->port_id, pkt->data, pkt->len);
+                    }
                 } else {
                     fprintf(stderr, "ice-mp: Skipping packet qid=%u port=%u pkt_len=%u nic=%p\n",
                             qid, q->port_id, pkt->len, s->nic[q->port_id]);
@@ -4630,6 +4633,7 @@ static Property ice_mp_properties[] = {
     DEFINE_PROP_UINT32("vfs", ICEMPState, num_vfs, 0),
     DEFINE_PROP_UINT32("rxq-map-mode", ICEMPState, rxq_map_mode, 0),
     DEFINE_PROP_UINT32("queues-per-port", ICEMPState, queues_per_port, 0),
+    DEFINE_PROP_BOOL("loopback-enable", ICEMPState, loopback_enable, false),
     DEFINE_PROP_NETDEV("netdev0", ICEMPState, conf[0].peers),
     DEFINE_PROP_NETDEV("netdev1", ICEMPState, conf[1].peers),
     DEFINE_PROP_NETDEV("netdev2", ICEMPState, conf[2].peers),
@@ -5479,8 +5483,10 @@ static void ice_mp_vf_tx_process(ICEMPVFState *vf, uint16_t qid)
                         NetClientState *nc = qemu_get_queue(pf->nic[port_id]);
                         qemu_send_packet(nc, tx_pkt->data, tx_pkt->len);
                     }
-                    /* Generate loopback responses */
-                    ice_mp_vf_tx_loopback(vf, q->port_id, tx_pkt->data, tx_pkt->len);
+                    if (pf->loopback_enable) {
+                        /* Generate loopback responses */
+                        ice_mp_vf_tx_loopback(vf, q->port_id, tx_pkt->data, tx_pkt->len);
+                    }
                 }
 
                 /* Write back descriptor done */

@@ -254,7 +254,7 @@ typedef struct IceMpRxRule {
 
 /* Scheduler node tracking for query/delete operations */
 #define ICE_MP_SCHED_TEID_BASE  0x16000000
-#define ICE_MP_MAX_SCHED_NODES  1024
+#define ICE_MP_MAX_SCHED_NODES  16384
 
 typedef struct IceMpSchedNode {
     bool valid;
@@ -356,6 +356,7 @@ struct ICEMPState {
     uint32_t port_status[ICE_MP_MAX_PORTS];
     uint32_t event_doorbell;
     uint8_t vf_port_map[ICE_MP_MAX_VFS];
+    uint8_t vf_mac[ICE_MP_MAX_VFS][6]; /* cached VF MACs for RX routing */
 
     /* Reset-related registers */
     uint32_t pfgen_ctrl;
@@ -1312,25 +1313,76 @@ static bool ice_mp_can_receive(NetClientState *nc)
     return false;
 }
 
+/*
+ * MAC-based VF lookup: match packet destination MAC against cached VF MACs
+ * on the given port. Used as fallback when no explicit RX rule matches.
+ * This emulates the hardware's default unicast MAC filter that real NICs
+ * maintain for each VF.
+ */
+static uint16_t ice_mp_select_vf_by_mac(ICEMPState *s, uint8_t port_id,
+                                         const uint8_t *buf, size_t len)
+{
+    const uint8_t *dst_mac;
+    static const uint8_t zero_mac[6] = {0};
+
+    if (len < 14 || !s->num_vfs) {
+        return 0xFFFF;
+    }
+
+    dst_mac = buf + ICE_MP_ETH_DA_OFFSET;
+
+    /* Skip broadcast/multicast — those go to PF */
+    if (dst_mac[0] & 0x01) {
+        return 0xFFFF;
+    }
+
+    for (uint16_t i = 0; i < s->num_vfs; i++) {
+        /* Only match VFs mapped to this port */
+        if (s->vf_port_map[i] != port_id) {
+            continue;
+        }
+
+        /* Skip VFs with no MAC set */
+        if (memcmp(s->vf_mac[i], zero_mac, 6) == 0) {
+            continue;
+        }
+
+        if (memcmp(dst_mac, s->vf_mac[i], 6) == 0) {
+            return i;
+        }
+    }
+
+    return 0xFFFF;
+}
+
+/*
+ * Forward declaration: deliver a received packet to a VF's RX queue.
+ * Defined later in the file after ICEMPVFState and ice_mp_vf_rx_enqueue.
+ */
+static bool ice_mp_deliver_to_vf(ICEMPState *s, uint16_t vf_id,
+                                  const uint8_t *buf, size_t size);
+
 static ssize_t ice_mp_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     ICEMPPort *port = qemu_get_nic_opaque(nc);
     ICEMPState *s = port->s;
     uint16_t vf_id;
 
-    fprintf(stderr, "ice-mp: receive called port=%u size=%zu\n", port->port_id, size);
-
+    /* Try explicit RX rules first */
     vf_id = ice_mp_select_vf(s, port->port_id, buf, size);
-    if (vf_id < s->num_vfs && s->vf_rxq_mapena[vf_id] && s->vf_rxq_num[vf_id]) {
-        uint16_t base = s->vf_rxq_base[vf_id];
-        uint16_t count = s->vf_rxq_num[vf_id];
-        uint16_t qid = base + (buf[ICE_MP_ETH_DA_OFFSET] % count);
+    if (vf_id >= s->num_vfs) {
+        /* Fallback: MAC-based VF matching (emulates HW default unicast filter) */
+        vf_id = ice_mp_select_vf_by_mac(s, port->port_id, buf, size);
+    }
 
-        if (ice_mp_rx_enqueue_queue(s, qid, buf, size)) {
+    /* Deliver to VF via VF's own RX queue and DMA context */
+    if (vf_id < s->num_vfs) {
+        if (ice_mp_deliver_to_vf(s, vf_id, buf, size)) {
             return size;
         }
     }
 
+    /* PF fallback: deliver to port's PF RX queue */
     if (ice_mp_rx_enqueue(s, port->port_id, buf, size)) {
         return size;
     }
@@ -2788,23 +2840,13 @@ static void ice_mp_adminq_add_sched_elems(struct ICEMPState *s, struct ice_mp_aq
     pci_dma_write(&s->parent_obj, addr, buf, 8 + (num_elems * 24));
     desc->datalen = cpu_to_le16(8 + (num_elems * 24));
     
-    fprintf(stderr, "ice-mp: 0x0401 wrote %d bytes to DMA buffer at 0x%lx\n",
-            8 + (num_elems * 32), addr);
-    
-    /* Set num_elem_resp in the descriptor response
-     * This is at offset 2 in the sched_elem_cmd structure (params[2-3])
+    /* Set num_elem_resp in the descriptor response (params[2-3]).
+     * This field represents the number of GROUPS processed, not the number
+     * of individual elements.  The driver sends grps_req=1 and expects
+     * num_groups_added==1 back; writing the per-group element count here
+     * causes -EIO when num_elems > 1.
      */
-    fprintf(stderr, "ice-mp: 0x0401 BEFORE setting params: params[2]=0x%02x params[3]=0x%02x\n",
-            desc->params[2], desc->params[3]);
-    
-    *(uint16_t *)&desc->params[2] = cpu_to_le16(num_elems);
-    
-    fprintf(stderr, "ice-mp: 0x0401 AFTER setting params: params[2]=0x%02x params[3]=0x%02x (set to %d)\n",
-            desc->params[2], desc->params[3], num_elems);
-    
-    fprintf(stderr, "ice-mp: 0x0401 response: num_elems_req=%d->resp=%d, datalen=%d, DMA addr=0x%lx\n",
-            buf_header ? le16_to_cpu(buf_header->num_elems) : 0,
-            num_elems, le16_to_cpu(desc->datalen), addr);
+    *(uint16_t *)&desc->params[2] = cpu_to_le16(1);
     
     /* Explicitly set retval to 0 for success */
     desc->retval = cpu_to_le16(0);
@@ -3569,6 +3611,17 @@ struct iavf_aq_desc {
 #define IAVF_VF_MAX_QUEUES               1
 #define IAVF_VF_MSIX_VECTORS             2  /* 1 queue vector + 1 AdminQ */
 
+/*
+ * VF MSI-X: Embedded in BAR0 to avoid QEMU's 4096-section limit.
+ * Each VF with a separate MSI-X BAR creates ~4-5 memory sections
+ * (table sub-region, PBA sub-region, gaps). With 2048 VFs that's
+ * 8000+ sections, exceeding the limit. By embedding in BAR0 and
+ * handling table R/W in our MMIO handler (without creating sub-region
+ * MemoryRegions), each VF stays at 1 section.
+ */
+#define IAVF_VF_MSIX_TABLE_IN_BAR0  0xF000  /* MSI-X table at BAR0+0xF000 */
+#define IAVF_VF_MSIX_PBA_IN_BAR0    0xF800  /* MSI-X PBA at BAR0+0xF800 */
+
 typedef struct ICEMPVFQueue {
     uint64_t base;          /* Ring base DMA address */
     uint16_t qlen;          /* Number of entries */
@@ -3626,9 +3679,6 @@ typedef struct ICEMPVFState {
     ICEMPVFQueue txq[IAVF_VF_MAX_QUEUES];
     ICEMPVFQueue rxq[IAVF_VF_MAX_QUEUES];
     bool queues_enabled;
-
-    /* MSI-X */
-    MemoryRegion msix_bar;
 } ICEMPVFState;
 
 OBJECT_DECLARE_SIMPLE_TYPE(ICEMPVFState, ICE_MP_VF)
@@ -4377,6 +4427,8 @@ static void ice_mp_realize(PCIDevice *pci_dev, Error **errp)
                       PCI_BASE_ADDRESS_MEM_TYPE_64 |
                       PCI_BASE_ADDRESS_MEM_PREFETCH,
                                   IAVF_VF_BAR0_SIZE);
+        /* VF MSI-X is embedded in BAR0 (no separate BAR3) to avoid
+         * QEMU's 4096 memory section limit with 2048 VFs. */
         fprintf(stderr,
             "ice-mp: SR-IOV cfg vf_offset=0x%x vf_stride=0x%x sup_pg=0x%x sys_pg=0x%x\n",
             pci_get_word(pci_conf + ICE_MP_SRIOV_OFFSET + PCI_SRIOV_VF_OFFSET),
@@ -4775,6 +4827,26 @@ static uint64_t ice_mp_vf_mmio_read(void *opaque, hwaddr addr, unsigned size)
             uint32_t i = (addr - 0xD000) / 4;
             val = vf->vfqf_hlut[i];
         }
+        /* MSI-X table: 0xF000 + vector*16 (embedded in BAR0) */
+        else if (addr >= IAVF_VF_MSIX_TABLE_IN_BAR0 &&
+                 addr < IAVF_VF_MSIX_TABLE_IN_BAR0 +
+                        IAVF_VF_MSIX_VECTORS * PCI_MSIX_ENTRY_SIZE) {
+            PCIDevice *pci = &vf->parent_obj;
+            unsigned offset = addr - IAVF_VF_MSIX_TABLE_IN_BAR0;
+            if (pci->msix_table) {
+                val = pci_get_long(pci->msix_table + offset);
+            }
+        }
+        /* MSI-X PBA: 0xF800 (embedded in BAR0) */
+        else if (addr >= IAVF_VF_MSIX_PBA_IN_BAR0 &&
+                 addr < IAVF_VF_MSIX_PBA_IN_BAR0 +
+                        QEMU_ALIGN_UP(IAVF_VF_MSIX_VECTORS, 64) / 8) {
+            PCIDevice *pci = &vf->parent_obj;
+            unsigned offset = addr - IAVF_VF_MSIX_PBA_IN_BAR0;
+            if (pci->msix_pba) {
+                val = pci_get_long(pci->msix_pba + offset);
+            }
+        }
         break;
     }
 
@@ -4892,6 +4964,43 @@ static void ice_mp_vf_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         else if (addr >= 0xD000 && addr < 0xD000 + 16 * 4) {
             uint32_t i = (addr - 0xD000) / 4;
             vf->vfqf_hlut[i] = (uint32_t)val;
+        }
+        /* MSI-X table writes: 0xF000 + vector*16 (embedded in BAR0).
+         * Update the internal msix_table so msix_notify() reads
+         * the correct addr/data.  Handle mask transitions. */
+        else if (addr >= IAVF_VF_MSIX_TABLE_IN_BAR0 &&
+                 addr < IAVF_VF_MSIX_TABLE_IN_BAR0 +
+                        IAVF_VF_MSIX_VECTORS * PCI_MSIX_ENTRY_SIZE) {
+            PCIDevice *pci = &vf->parent_obj;
+            unsigned offset = addr - IAVF_VF_MSIX_TABLE_IN_BAR0;
+            if (pci->msix_table) {
+                int vector = offset / PCI_MSIX_ENTRY_SIZE;
+                bool was_masked = msix_is_masked(pci, vector);
+                pci_set_long(pci->msix_table + offset, (uint32_t)val);
+                bool is_masked = msix_is_masked(pci, vector);
+                /* If vector became unmasked, fire any pending interrupt */
+                if (was_masked && !is_masked) {
+                    if (vector < IAVF_VF_MSIX_VECTORS) {
+                        unsigned pba_off = vector / 8;
+                        uint8_t pba_bit = 1 << (vector % 8);
+                        if (pci->msix_pba[pba_off] & pba_bit) {
+                            pci->msix_pba[pba_off] &= ~pba_bit;
+                            MSIMessage msg = msix_get_message(pci, vector);
+                            msi_send_message(pci, msg);
+                        }
+                    }
+                }
+            }
+        }
+        /* MSI-X PBA writes: 0xF800 (normally read-only, but store anyway) */
+        else if (addr >= IAVF_VF_MSIX_PBA_IN_BAR0 &&
+                 addr < IAVF_VF_MSIX_PBA_IN_BAR0 +
+                        QEMU_ALIGN_UP(IAVF_VF_MSIX_VECTORS, 64) / 8) {
+            PCIDevice *pci = &vf->parent_obj;
+            unsigned offset = addr - IAVF_VF_MSIX_PBA_IN_BAR0;
+            if (pci->msix_pba) {
+                pci_set_long(pci->msix_pba + offset, (uint32_t)val);
+            }
         }
         break;
     }
@@ -5348,6 +5457,50 @@ static void ice_mp_vf_handle_virtchnl(ICEMPVFState *vf, uint32_t v_opcode,
 }
 
 /*
+ * MSI-X prepare_message callback for manual MSI-X (reads from msix_table).
+ * This replicates the static msix_prepare_message() from msix.c which is
+ * normally installed by msix_init().  Since we bypass msix_init() to avoid
+ * creating sub-region MemoryRegions (and thus blowing the 4096-section
+ * limit), we must supply this callback ourselves.
+ */
+static MSIMessage ice_mp_vf_msix_prepare_message(PCIDevice *dev,
+                                                  unsigned vector)
+{
+    uint8_t *table_entry = dev->msix_table + vector * PCI_MSIX_ENTRY_SIZE;
+    MSIMessage msg;
+    msg.address = pci_get_quad(table_entry + PCI_MSIX_ENTRY_LOWER_ADDR);
+    msg.data = pci_get_long(table_entry + PCI_MSIX_ENTRY_DATA);
+    return msg;
+}
+
+/*
+ * VF MSI-X interrupt delivery: directly construct and send MSI message
+ * instead of using QEMU's msix_notify().  This avoids potential issues
+ * with our manual MSI-X setup (no sub-region MemoryRegions).
+ * If the vector is masked, set it as pending in the PBA.
+ */
+static void ice_mp_vf_msix_notify(ICEMPVFState *vf, unsigned int vector)
+{
+    PCIDevice *pci = &vf->parent_obj;
+
+    if (!msix_enabled(pci) || vector >= IAVF_VF_MSIX_VECTORS) {
+        return;
+    }
+    if (!pci->msix_table || !pci->msix_entry_used ||
+        !pci->msix_entry_used[vector]) {
+        return;
+    }
+    if (msix_is_masked(pci, vector)) {
+        msix_set_pending(pci, vector);
+        return;
+    }
+    MSIMessage msg = msix_get_message(pci, vector);
+    if (msg.address != 0 && pci->msi_trigger) {
+        msi_send_message(pci, msg);
+    }
+}
+
+/*
  * Process pending ASQ descriptors: called when ATQT1 is written.
  * Reads descriptors from the ASQ ring, processes virtchnl messages,
  * writes responses to the ARQ ring, and fires AdminQ interrupt.
@@ -5412,11 +5565,9 @@ static void ice_mp_vf_process_atq(ICEMPVFState *vf)
     }
 
     /* Fire AdminQ interrupt (MSI-X vector 0) if enabled */
-    if (msix_enabled(pci) && (vf->vfint_icr0_ena1 & BIT(30))) {
+    if (vf->vfint_icr0_ena1 & BIT(30)) {
         vf->vfint_icr01 |= BIT(30);  /* Set AdminQ cause bit */
-        fprintf(stderr, "ice-mp-vf%u: Firing AdminQ MSI-X interrupt (vec 0)\n",
-                vf->vf_number);
-        msix_notify(pci, 0);
+        ice_mp_vf_msix_notify(vf, 0);
     }
 }
 
@@ -5499,10 +5650,10 @@ static void ice_mp_vf_tx_process(ICEMPVFState *vf, uint16_t qid)
                               sizeof(desc.cmd_type_offset_bsz));
 
                 /* Fire TX completion interrupt */
-                if (msix_enabled(pci) && (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M)) {
+                if (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M) {
                     uint16_t msix_idx = q->int_ctl & ICE_MP_QINT_MSIX_INDX_M;
                     if (msix_idx < IAVF_VF_MSIX_VECTORS) {
-                        msix_notify(pci, msix_idx);
+                        ice_mp_vf_msix_notify(vf, msix_idx);
                     }
                 }
 
@@ -5567,14 +5718,46 @@ static bool ice_mp_vf_rx_enqueue(ICEMPVFState *vf, uint16_t qid,
     q->head = (q->head + 1) % ring_size;
 
     /* Fire RX interrupt */
-    if (msix_enabled(pci) && (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M)) {
+    if (q->int_ctl & ICE_MP_QINT_CAUSE_ENA_M) {
         uint16_t msix_idx = q->int_ctl & ICE_MP_QINT_MSIX_INDX_M;
         if (msix_idx < IAVF_VF_MSIX_VECTORS) {
-            msix_notify(pci, msix_idx);
+            ice_mp_vf_msix_notify(vf, msix_idx);
         }
     }
 
     return true;
+}
+
+/*
+ * Deliver a received packet to a VF's RX queue, using the VF's own DMA
+ * context.  Called from ice_mp_receive() via forward declaration.
+ */
+static bool ice_mp_deliver_to_vf(ICEMPState *s, uint16_t vf_id,
+                                  const uint8_t *buf, size_t size)
+{
+    PCIDevice *pf = &s->parent_obj;
+
+    if (!pf->exp.sriov_pf.vf || vf_id >= pf->exp.sriov_pf.num_vfs) {
+        return false;
+    }
+
+    PCIDevice *vf_pci = pf->exp.sriov_pf.vf[vf_id];
+    if (!vf_pci) {
+        return false;
+    }
+
+    ICEMPVFState *vf = ICE_MP_VF(vf_pci);
+
+    /* Try each enabled RX queue on the VF */
+    for (uint16_t q = 0; q < IAVF_VF_MAX_QUEUES; q++) {
+        if (vf->rxq[q].enabled) {
+            if (ice_mp_vf_rx_enqueue(vf, q, buf, size)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
 /*
@@ -5739,6 +5922,71 @@ static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
                          "ice-mp-vf-mmio", IAVF_VF_BAR0_SIZE);
     pcie_sriov_vf_register_bar(pci_dev, 0, &vf->bar0);
 
+    /*
+     * Manual MSI-X setup: embed table/PBA in BAR0 without creating
+     * sub-region MemoryRegions.  This avoids QEMU's 4096-section limit.
+     * We set up the PCI config space capability and allocate the internal
+     * msix_table/msix_pba arrays so that msix_notify(), msix_enabled(),
+     * msix_is_masked() etc. all work normally.  The guest's MSI-X table
+     * reads/writes at BAR0+0xF000 are handled in the BAR0 MMIO handler.
+     */
+    {
+        int cap;
+        uint8_t *config;
+        unsigned table_size = IAVF_VF_MSIX_VECTORS * PCI_MSIX_ENTRY_SIZE;
+        unsigned pba_size = QEMU_ALIGN_UP(IAVF_VF_MSIX_VECTORS, 64) / 8;
+
+        /* Add MSI-X capability to PCI config space at offset 0x70 */
+        cap = pci_add_capability(pci_dev, PCI_CAP_ID_MSIX,
+                                 0x70, MSIX_CAP_LENGTH, errp);
+        if (cap < 0) {
+            error_setg(errp, "VF%u: Failed to add MSI-X capability",
+                       vf->vf_number);
+            return;
+        }
+
+        pci_dev->msix_cap = cap;
+        pci_dev->cap_present |= QEMU_PCI_CAP_MSIX;
+        config = pci_dev->config + cap;
+
+        /* Message Control: table size (nentries - 1) */
+        pci_set_word(config + PCI_MSIX_FLAGS, IAVF_VF_MSIX_VECTORS - 1);
+        pci_dev->msix_entries_nr = IAVF_VF_MSIX_VECTORS;
+        pci_dev->msix_function_masked = true;
+
+        /* Table in BAR0 at offset 0xF000, BIR=0 */
+        pci_set_long(config + PCI_MSIX_TABLE,
+                     IAVF_VF_MSIX_TABLE_IN_BAR0 | 0);
+        /* PBA in BAR0 at offset 0xF800, BIR=0 */
+        pci_set_long(config + PCI_MSIX_PBA,
+                     IAVF_VF_MSIX_PBA_IN_BAR0 | 0);
+
+        /* Make MSI-X Enable and Function Mask bits writable */
+        pci_dev->wmask[cap + PCI_MSIX_FLAGS + 1] |=
+            (uint8_t)((PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL) >> 8);
+
+        /* Allocate internal MSI-X arrays (used by msix_notify et al.) */
+        pci_dev->msix_table = g_malloc0(table_size);
+        pci_dev->msix_pba = g_malloc0(pba_size);
+        pci_dev->msix_entry_used = g_malloc0(
+            IAVF_VF_MSIX_VECTORS * sizeof(*pci_dev->msix_entry_used));
+
+        /* Set the prepare_message callback (normally done by msix_init) */
+        pci_dev->msix_prepare_message = ice_mp_vf_msix_prepare_message;
+
+        /* Mask all vectors initially */
+        for (int i = 0; i < IAVF_VF_MSIX_VECTORS; i++) {
+            unsigned offset = i * PCI_MSIX_ENTRY_SIZE +
+                              PCI_MSIX_ENTRY_VECTOR_CTRL;
+            pci_dev->msix_table[offset] = PCI_MSIX_ENTRY_CTRL_MASKBIT;
+        }
+
+        /* Mark all vectors as used so msix_notify() delivers them */
+        for (int i = 0; i < IAVF_VF_MSIX_VECTORS; i++) {
+            msix_vector_use(pci_dev, i);
+        }
+    }
+
     /* Initialize VF state */
     vf->vfgen_rstat = 2;  /* VFACTIVE - VF is ready */
     vf->version_negotiated = false;
@@ -5753,6 +6001,11 @@ static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
     vf->mac_addr[4] = vf->vf_number + 1;
     vf->mac_addr[5] = 0x00;
 
+    /* Cache VF MAC in PF state for fast RX routing lookup */
+    if (vf->pf && vf->vf_number < ICE_MP_MAX_VFS) {
+        memcpy(vf->pf->vf_mac[vf->vf_number], vf->mac_addr, 6);
+    }
+
     /* Zero out all queue state */
     memset(vf->txq, 0, sizeof(vf->txq));
     memset(vf->rxq, 0, sizeof(vf->rxq));
@@ -5763,12 +6016,34 @@ static void ice_mp_vf_realize(PCIDevice *pci_dev, Error **errp)
             vf->mac_addr[3], vf->mac_addr[4], vf->mac_addr[5]);
 }
 
+static void ice_mp_vf_exit(PCIDevice *pci_dev)
+{
+    /* Custom MSI-X cleanup — we did NOT create sub-region MemoryRegions,
+     * so we cannot call msix_uninit() (it tries to remove sub-regions).
+     * Instead, free the arrays and clear capability state manually. */
+    if (pci_dev->cap_present & QEMU_PCI_CAP_MSIX) {
+        msix_unuse_all_vectors(pci_dev);
+        pci_del_capability(pci_dev, PCI_CAP_ID_MSIX, MSIX_CAP_LENGTH);
+        pci_dev->msix_cap = 0;
+        pci_dev->msix_entries_nr = 0;
+        g_free(pci_dev->msix_pba);
+        pci_dev->msix_pba = NULL;
+        g_free(pci_dev->msix_table);
+        pci_dev->msix_table = NULL;
+        g_free(pci_dev->msix_entry_used);
+        pci_dev->msix_entry_used = NULL;
+        pci_dev->msix_prepare_message = NULL;
+        pci_dev->cap_present &= ~QEMU_PCI_CAP_MSIX;
+    }
+}
+
 static void ice_mp_vf_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
     k->realize = ice_mp_vf_realize;
+    k->exit = ice_mp_vf_exit;
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = ICE_MP_VF_DEV_ID;
     k->revision = 0x01;

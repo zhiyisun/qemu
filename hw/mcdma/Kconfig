@@ -1,0 +1,4 @@
+config MCDMA
+    bool
+    default y
+    depends on PCI

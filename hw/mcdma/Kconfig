@@ -2,3 +2,8 @@ config MCDMA
     bool
     default y
     depends on PCI
+
+config MCDMA_CRYPTO
+    bool
+    default y
+    depends on PCI

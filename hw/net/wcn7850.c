@@ -405,6 +405,13 @@ typedef struct {
 #define WMI_TAG_HAL_REG_CAPABILITIES_EXT   531
 #define WMI_TAG_SOC_HAL_REG_CAPABILITIES   532
 
+/* Regulatory channel-list event (sent during init so the driver populates
+ * ab->default_regd instead of falling back to the world domain). */
+#define WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT  938
+#define WMI_REG_CHAN_LIST_CC_EVENTID        0x3a003
+#define WMI_REG_CLIENT_MAX                  4
+#define WMI_REG_SET_CC_STATUS_PASS          0
+
 #define WMI_HOST_WLAN_2GHZ_CAP  1
 #define WMI_HOST_WLAN_5GHZ_CAP  2
 #define WMI_HOST_HW_MODE_DBS    1
@@ -1252,7 +1259,6 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
     uint32_t esize = s->ce_dst_entry_size[ce_pipe] ?: 16;
     uint32_t ring_sz = s->ce_dst_size[ce_pipe] ?: (WCN7850_CE_DST_RING_SIZE * esize);
     if (!base || !ring_sz) {
-        qemu_log("WCN: wmi_send pipe=%d no base/sz\n", ce_pipe);
         return;
     }
 
@@ -1271,18 +1277,15 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
     if (pci_dma_read(pci_dev, desc_addr, &desc, sizeof(desc)) != MEMTX_OK)
         return;
 
-    uint64_t buf_addr = (uint64_t)desc.buf_addr_low |
-                        ((uint64_t)(desc.buf_addr_info & 0xff) << 32);
-    if (!buf_addr)
-        return;
+	uint64_t buf_addr = (uint64_t)desc.buf_addr_low |
+                         ((uint64_t)(desc.buf_addr_info & 0xff) << 32);
+     if (!buf_addr)
+         return;
 
-    if (data_len > 2048)
-        data_len = 2048;
+     if (data_len > 2048)
+         data_len = 2048;
 
-    fprintf(stderr, "WCN: wmi_send pipe=%d len=%u buf_addr=0x%lx\n",
-            ce_pipe, data_len, (unsigned long)buf_addr);
-
-    /* Write WMI data into the buffer */
+     /* Write WMI data into the buffer */
     if (pci_dma_write(pci_dev, buf_addr, data, data_len) != MEMTX_OK)
         return;
 
@@ -1364,6 +1367,155 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
     }
 }
 
+/* Build and send a WMI_REG_CHAN_LIST_CC_EVENT so the driver populates
+ * ab->default_regd during init (instead of falling back to the world
+ * regulatory domain). Mirrors the firmware's regulatory channel-list EXT
+ * event: a top-level TLV carrying the event struct, followed by a flat array
+ * of ext reg-rule params (2 GHz + 5 GHz only; 6 GHz counts are left 0). */
+static void wcn7850_send_wmi_reg_chan_list_cc(WCN7850State *s, PCIDevice *pci_dev)
+{
+    struct QEMU_PACKED wmi_reg_rule_ext_params {
+        uint32_t tlv_header;
+        uint32_t freq_info;
+        uint32_t bw_pwr_info;
+        uint32_t flag_info;
+        uint32_t psd_power_info;
+    };
+
+    struct QEMU_PACKED wmi_reg_chan_list_cc_ext_event {
+        uint32_t status_code;
+        uint32_t phy_id;
+        uint32_t alpha2;
+        uint32_t num_phy;
+        uint32_t country_id;
+        uint32_t domain_code;
+        uint32_t dfs_region;
+        uint32_t phybitmap;
+        uint32_t min_bw_2g;
+        uint32_t max_bw_2g;
+        uint32_t min_bw_5g;
+        uint32_t max_bw_5g;
+        uint32_t num_2g_reg_rules;
+        uint32_t num_5g_reg_rules;
+        uint32_t client_type;
+        uint32_t rnr_tpe_usable;
+        uint32_t unspecified_ap_usable;
+        uint32_t domain_code_6g_ap_lpi;
+        uint32_t domain_code_6g_ap_sp;
+        uint32_t domain_code_6g_ap_vlp;
+        uint32_t domain_code_6g_client_lpi[WMI_REG_CLIENT_MAX];
+        uint32_t domain_code_6g_client_sp[WMI_REG_CLIENT_MAX];
+        uint32_t domain_code_6g_client_vlp[WMI_REG_CLIENT_MAX];
+        uint32_t domain_code_6g_super_id;
+        uint32_t min_bw_6g_ap_sp;
+        uint32_t max_bw_6g_ap_sp;
+        uint32_t min_bw_6g_ap_lpi;
+        uint32_t max_bw_6g_ap_lpi;
+        uint32_t min_bw_6g_ap_vlp;
+        uint32_t max_bw_6g_ap_vlp;
+        uint32_t min_bw_6g_client_sp[WMI_REG_CLIENT_MAX];
+        uint32_t max_bw_6g_client_sp[WMI_REG_CLIENT_MAX];
+        uint32_t min_bw_6g_client_lpi[WMI_REG_CLIENT_MAX];
+        uint32_t max_bw_6g_client_lpi[WMI_REG_CLIENT_MAX];
+        uint32_t min_bw_6g_client_vlp[WMI_REG_CLIENT_MAX];
+        uint32_t max_bw_6g_client_vlp[WMI_REG_CLIENT_MAX];
+        uint32_t num_6g_reg_rules_ap_sp;
+        uint32_t num_6g_reg_rules_ap_lpi;
+        uint32_t num_6g_reg_rules_ap_vlp;
+        uint32_t num_6g_reg_rules_cl_sp[WMI_REG_CLIENT_MAX];
+        uint32_t num_6g_reg_rules_cl_lpi[WMI_REG_CLIENT_MAX];
+        uint32_t num_6g_reg_rules_cl_vlp[WMI_REG_CLIENT_MAX];
+    };
+
+    /* 2 GHz + 5 GHz rules (start/end MHz, max bandwidth MHz, reg power dBm). */
+    static const struct { uint32_t start, end, max_bw, reg_pwr; } rules_2g[] = {
+        { 2412, 2484, 40, 20 },
+    };
+    static const struct { uint32_t start, end, max_bw, reg_pwr; } rules_5g[] = {
+        { 5180, 5320, 80, 23 },
+        { 5500, 5720, 160, 23 },
+        { 5745, 5895, 80, 23 },
+    };
+    const uint32_t n2 = sizeof(rules_2g) / sizeof(rules_2g[0]);
+    const uint32_t n5 = sizeof(rules_5g) / sizeof(rules_5g[0]);
+
+    uint8_t buf[1024];
+    uint32_t off = 0;
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    WmiTlv *tlv;
+    uint32_t tlv_start;
+
+    hdr->cmd_id = cpu_to_le32(WMI_REG_CHAN_LIST_CC_EVENTID);
+    off += sizeof(*hdr);
+
+#define OPEN_TLV(_tag) do { \
+        tlv_start = off; \
+        tlv = (WmiTlv *)(buf + off); \
+        off += sizeof(*tlv); \
+    } while (0)
+#define CLOSE_TLV(_tag) do { \
+        tlv->header = WMI_TLV_HDR((_tag), off - (tlv_start + sizeof(*tlv))); \
+    } while (0)
+
+    OPEN_TLV(WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT);
+    struct wmi_reg_chan_list_cc_ext_event *ev =
+        (struct wmi_reg_chan_list_cc_ext_event *)(buf + off);
+    memset(ev, 0, sizeof(*ev));
+    ev->status_code = cpu_to_le32(WMI_REG_SET_CC_STATUS_PASS);
+    ev->phy_id = cpu_to_le32(0);
+    ev->alpha2 = cpu_to_le32(0x3030); /* "00" world regulatory domain */
+    ev->num_phy = cpu_to_le32(1);
+    ev->phybitmap = cpu_to_le32(1);
+    ev->min_bw_2g = cpu_to_le32(20);
+    ev->max_bw_2g = cpu_to_le32(40);
+    ev->min_bw_5g = cpu_to_le32(20);
+    ev->max_bw_5g = cpu_to_le32(160);
+    ev->num_2g_reg_rules = cpu_to_le32(n2);
+    ev->num_5g_reg_rules = cpu_to_le32(n5);
+    off += sizeof(*ev);
+    CLOSE_TLV(WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT);
+
+    /* The driver skips an (ignored) wmi_tlv header between the event struct
+     * and the flat reg-rule array. */
+    tlv = (WmiTlv *)(buf + off);
+    tlv->header = WMI_TLV_HDR(0, (n2 + n5) * sizeof(struct wmi_reg_rule_ext_params));
+    off += sizeof(*tlv);
+
+    for (uint32_t i = 0; i < n2; i++) {
+        struct wmi_reg_rule_ext_params *r = (struct wmi_reg_rule_ext_params *)(buf + off);
+        r->tlv_header = 0;
+        r->freq_info = cpu_to_le32((rules_2g[i].start & 0xffff) |
+                                   ((rules_2g[i].end & 0xffff) << 16));
+        r->bw_pwr_info = cpu_to_le32((rules_2g[i].max_bw & 0xffff) |
+                                     ((rules_2g[i].reg_pwr & 0xff) << 16));
+        r->flag_info = 0;
+        r->psd_power_info = 0;
+        off += sizeof(*r);
+    }
+    for (uint32_t i = 0; i < n5; i++) {
+        struct wmi_reg_rule_ext_params *r = (struct wmi_reg_rule_ext_params *)(buf + off);
+        r->tlv_header = 0;
+        r->freq_info = cpu_to_le32((rules_5g[i].start & 0xffff) |
+                                   ((rules_5g[i].end & 0xffff) << 16));
+        r->bw_pwr_info = cpu_to_le32((rules_5g[i].max_bw & 0xffff) |
+                                     ((rules_5g[i].reg_pwr & 0xff) << 16));
+        r->flag_info = 0;
+        r->psd_power_info = 0;
+        off += sizeof(*r);
+    }
+
+#undef OPEN_TLV
+#undef CLOSE_TLV
+
+    uint32_t total_len = off;
+    uint8_t htc_buf[2048];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32(HTC_EP_WMI | (total_len << 16));
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total_len);
+    wcn7850_wmi_send_event(s, pci_dev, 1, htc_buf, sizeof(*h) + total_len);
+}
+
 /* Build and send a WMI_SERVICE_READY_EVENT to the driver */
 static void wcn7850_send_wmi_service_ready_ext(WCN7850State *s, PCIDevice *pci_dev);
 
@@ -1425,6 +1577,7 @@ static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
                             htc_buf, sizeof(*hdr2) + total_len);
 
     wcn7850_send_wmi_service_ready_ext(s, pci_dev);
+    wcn7850_send_wmi_reg_chan_list_cc(s, pci_dev);
     s->wmi_service_ready_sent = true;
 }
 

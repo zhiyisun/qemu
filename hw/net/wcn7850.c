@@ -26,11 +26,18 @@
 #define WCN7850_BAR0_SIZE (2 * 1024 * 1024)
 #define WCN7850_WINDOW_START 0x80000
 #define WCN7850_WINDOW_SIZE 0x80000
+/* With static_window_map the driver maps CE to 2*WINDOW_START and UMAC to
+ * 3*WINDOW_START and accesses them directly, without the window register. */
+#define WCN7850_CE_WINDOW_BASE   (2 * WCN7850_WINDOW_START)
+#define WCN7850_UMAC_WINDOW_BASE (3 * WCN7850_WINDOW_START)
 #define WCN7850_WINDOW_REG 0x310c
 
 /* CE shadow register base (doorbell writes for CE HP/TP) */
 #define WCN7850_SHADOW_BASE     0x000008fc
 #define WCN7850_SHADOW_MAX      64
+
+/* CE MSI base vector (WCN7850: MHI=0-2, CE=3-7, DP=8-15) */
+#define WCN7850_CE_MSI_BASE     3
 
 /* CE SRNG register layout (through window with select=55) */
 #define WCN7850_CE0_SRC_BASE    0x01b80000
@@ -76,6 +83,14 @@
 
 #define WCN7850_MSI_VECTORS 16
 #define WCN7850_CE_COUNT 9
+
+/* WCN7850 MSI layout (ath12k_msi_config in wifi7/pci.c):
+ *   MHI: base_vector 0 (vectors 0..2)
+ *   CE:  base_vector 3 (vectors 3..7 for CE0..CE3, CE5)
+ * The ath12k driver assigns each CE pipe an MSI vector index of
+ *   CE_MSI_BASE + (count of non-CE_ATTR_DIS_INTR CEs before this pipe),
+ * which matches ath12k_pci_get_ce_msi_idx. */
+#define WCN7850_CE_MSI_BASE 3
 
 #define MHI_DEV_WAKE_DB 127
 
@@ -147,20 +162,19 @@
 #define WMI_TLV_LEN                GENMASK(15, 0)
 
 /* WMI command groups */
-#define WMI_GRP_INIT       0x1
-#define WMI_GRP_VDEV       0x13
-#define WMI_GRP_PEER       0x14
-#define WMI_GRP_MGMT       0x1B
-#define WMI_GRP_SCAN       0x10
-#define WMI_GRP_PDEV       0x12
-#define WMI_GRP_WMI        0x100 /* not real group, for service ready */
+/* These MUST match the driver's enum wmi_cmd_group */
+#define WMI_GRP_SCAN       0x3
+#define WMI_GRP_PDEV       0x4
+#define WMI_GRP_VDEV       0x5
+#define WMI_GRP_PEER       0x6
+#define WMI_GRP_MGMT       0x7
 
 #define WMI_TLV_CMD(grp_id) (((grp_id) << 12) | 0x1)
 
 /* WMI command IDs */
 #define WMI_SERVICE_READY_EVENTID  0x1
 #define WMI_READY_EVENTID          0x2
-#define WMI_INIT_CMDID             WMI_TLV_CMD(WMI_GRP_INIT)
+#define WMI_INIT_CMDID             0x1
 #define WMI_VDEV_CREATE_CMDID      WMI_TLV_CMD(WMI_GRP_VDEV)
 #define WMI_PEER_CREATE_CMDID      WMI_TLV_CMD(WMI_GRP_PEER)
 
@@ -233,6 +247,7 @@ typedef struct {
 /* QRTR protocol constants */
 #define QRTR_PROTO_VER_1 1
 #define QRTR_TYPE_DATA 1
+#define QRTR_TYPE_RESUME_TX 7
 #define QRTR_TYPE_NEW_SERVER 4
 #define QRTR_PORT_CTRL 0xfffffffeu
 #define QRTR_NODE_HOST 1
@@ -379,6 +394,110 @@ typedef struct {
 
 #define WMI_TLV_HDR(tag, len) cpu_to_le32(((tag) << 16) | (len))
 
+/* WMI service-ready EXT event (driver ath12k parses this to complete
+ * ab->wmi_ab.service_ready). */
+#define WMI_SERVICE_READY_EXT_EVENTID  0x4009
+#define WMI_TAG_ARRAY_STRUCT           18
+#define WMI_TAG_SERVICE_READY_EXT_EVENT   428
+#define WMI_TAG_MAC_PHY_CAPABILITIES   528
+#define WMI_TAG_HW_MODE_CAPABILITIES   529
+#define WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS   530
+#define WMI_TAG_HAL_REG_CAPABILITIES_EXT   531
+#define WMI_TAG_SOC_HAL_REG_CAPABILITIES   532
+
+#define WMI_HOST_WLAN_2GHZ_CAP  1
+#define WMI_HOST_WLAN_5GHZ_CAP  2
+#define WMI_HOST_HW_MODE_DBS    1
+
+typedef struct {
+    uint32_t numss_m1;
+    uint32_t ru_info;
+    uint32_t ppet16_ppet8_ru3_ru0[8];
+} QEMU_PACKED WmiPpeThreshold;
+
+typedef struct {
+    uint32_t default_conc_scan_config_bits;
+    uint32_t default_fw_config_bits;
+    WmiPpeThreshold ppet;
+    uint32_t he_cap_info;
+    uint32_t mpdu_density;
+    uint32_t max_bssid_rx_filters;
+    uint32_t fw_build_vers_ext;
+    uint32_t max_nlo_ssids;
+    uint32_t max_bssid_indicator;
+    uint32_t he_cap_info_ext;
+} QEMU_PACKED WmiServiceReadyExt;
+
+typedef struct {
+    uint32_t num_hw_modes;
+    uint32_t num_chainmask_tables;
+} QEMU_PACKED WmiSocMacPhyHwModeCaps;
+
+typedef struct {
+    uint32_t tlv_header;
+    uint32_t hw_mode_id;
+    uint32_t phy_id_map;
+    uint32_t hw_mode_config_type;
+} QEMU_PACKED WmiHwModeCap;
+
+typedef struct {
+    uint32_t hw_mode_id;
+    uint32_t pdev_and_hw_link_ids;
+    uint32_t phy_id;
+    uint32_t supported_flags;
+    uint32_t supported_bands;
+    uint32_t ampdu_density;
+    uint32_t max_bw_supported_2g;
+    uint32_t ht_cap_info_2g;
+    uint32_t vht_cap_info_2g;
+    uint32_t vht_supp_mcs_2g;
+    uint32_t he_cap_info_2g;
+    uint32_t he_supp_mcs_2g;
+    uint32_t tx_chain_mask_2g;
+    uint32_t rx_chain_mask_2g;
+    uint32_t max_bw_supported_5g;
+    uint32_t ht_cap_info_5g;
+    uint32_t vht_cap_info_5g;
+    uint32_t vht_supp_mcs_5g;
+    uint32_t he_cap_info_5g;
+    uint32_t he_supp_mcs_5g;
+    uint32_t tx_chain_mask_5g;
+    uint32_t rx_chain_mask_5g;
+    uint32_t he_cap_phy_info_2g[3];
+    uint32_t he_cap_phy_info_5g[3];
+    WmiPpeThreshold he_ppet2g;
+    WmiPpeThreshold he_ppet5g;
+    uint32_t chainmask_table_id;
+    uint32_t lmac_id;
+    uint32_t he_cap_info_2g_ext;
+    uint32_t he_cap_info_5g_ext;
+    uint32_t he_cap_info_internal;
+    uint32_t wireless_modes;
+    uint32_t low_2ghz_chan_freq;
+    uint32_t high_2ghz_chan_freq;
+    uint32_t low_5ghz_chan_freq;
+    uint32_t high_5ghz_chan_freq;
+    uint32_t nss_ratio;
+} QEMU_PACKED WmiMacPhyCaps;
+
+typedef struct {
+    uint32_t num_phy;
+} QEMU_PACKED WmiSocHalRegCaps;
+
+typedef struct {
+    uint32_t tlv_header;
+    uint32_t phy_id;
+    uint32_t eeprom_reg_domain;
+    uint32_t eeprom_reg_domain_ext;
+    uint32_t regcap1;
+    uint32_t regcap2;
+    uint32_t wireless_modes;
+    uint32_t low_2ghz_chan;
+    uint32_t high_2ghz_chan;
+    uint32_t low_5ghz_chan;
+    uint32_t high_5ghz_chan;
+} QEMU_PACKED WmiHalRegCapsExt;
+
 typedef struct WCN7850State {
     PCIDevice parent_obj;
     MemoryRegion bar0_mmio;
@@ -453,6 +572,13 @@ typedef struct WCN7850State {
 
     /* CE doorbell delivery: true after QMI boot completes */
     bool ce_ready;
+
+    /* HTC ready sent: set after we successfully send HTC ready to driver */
+    bool htc_ready_sent;
+
+    /* WMI_SERVICE_READY pending: set when WMI service connects, sent once
+     * the driver has posted rx buffers on the WMI downlink CE (pipe 2). */
+    bool wmi_service_ready_pending;
 
     /* CE source ring doorbell state (shadow of HP values from driver) */
     uint32_t ce_src_hp[WCN7850_CE_COUNT];
@@ -1101,19 +1227,40 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
 /* Send a WMI event via CE destination ring (pipe EP 2 for RX WMI).
  * Writes WMI event data into a CE dest ring buffer, advances HP, triggers MSI.
  */
+/* Map a CE pipe to its MSI vector index, matching the ath12k driver's
+ * ath12k_pci_get_ce_msi_idx: count of CE pipes without CE_ATTR_DIS_INTR
+ * that come before this pipe. WCN7850 config: CE4/6/7/8 have DIS_INTR. */
+static int wcn7850_ce_msi_vector(int ce_pipe)
+{
+    static const int dis_intr[] = { 4, 6, 7, 8 };
+    int idx = 0, i, d;
+    for (i = 0; i < ce_pipe && i < WCN7850_CE_COUNT; i++) {
+        int skip = 0;
+        for (d = 0; d < (int)ARRAY_SIZE(dis_intr); d++)
+            if (dis_intr[d] == i) { skip = 1; break; }
+        if (!skip)
+            idx++;
+    }
+    return WCN7850_CE_MSI_BASE + idx;
+}
+
 static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
-                                      int ce_pipe, const void *data,
-                                      uint32_t data_len, int msivec)
+                                  int ce_pipe, const void *data,
+                                  uint32_t data_len)
 {
     uint64_t base = s->ce_dst_base[ce_pipe];
     uint32_t esize = s->ce_dst_entry_size[ce_pipe] ?: 16;
     uint32_t ring_sz = s->ce_dst_size[ce_pipe] ?: (WCN7850_CE_DST_RING_SIZE * esize);
-    if (!base || !ring_sz)
+    if (!base || !ring_sz) {
+        qemu_log("WCN: wmi_send pipe=%d no base/sz\n", ce_pipe);
         return;
+    }
 
-    /* Check pending: must have at least one descriptor available */
-    if (!s->ce_dst_pending[ce_pipe])
-        return;
+    /* We don't reliably track the driver's posted-buffer count (the driver
+     * assigns CE shadow indices dynamically), so instead of gating on a
+     * pending counter we read the descriptor at the current consumer slot:
+     * if the driver hasn't posted a buffer there yet (buf_addr == 0) we
+     * simply return and the caller retries later. */
 
     /* Read dest ring entry at current consumer position to get buffer address */
     uint64_t desc_addr = base + s->ce_dst_cons[ce_pipe];
@@ -1132,6 +1279,9 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
     if (data_len > 2048)
         data_len = 2048;
 
+    fprintf(stderr, "WCN: wmi_send pipe=%d len=%u buf_addr=0x%lx\n",
+            ce_pipe, data_len, (unsigned long)buf_addr);
+
     /* Write WMI data into the buffer */
     if (pci_dma_write(pci_dev, buf_addr, data, data_len) != MEMTX_OK)
         return;
@@ -1140,7 +1290,8 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
     s->ce_dst_cons[ce_pipe] += esize;
     if (s->ce_dst_cons[ce_pipe] >= ring_sz)
         s->ce_dst_cons[ce_pipe] = 0;
-    s->ce_dst_pending[ce_pipe]--;
+    if (s->ce_dst_pending[ce_pipe])
+        s->ce_dst_pending[ce_pipe]--;
 
     /* Write CE dst status descriptor and advance STATUS HP */
     if (s->ce_sts_base[ce_pipe]) {
@@ -1148,29 +1299,74 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
         uint32_t sts_hp = s->ce_sts_hp[ce_pipe];
         uint8_t sts_desc[16] = {0};
         *(uint32_t *)sts_desc = cpu_to_le32(data_len << 16);
+        fprintf(stderr, "WCN: write sts_desc pipe=%d at 0x%lx len=%u hp=%u\n",
+                 ce_pipe, (unsigned long)(s->ce_sts_base[ce_pipe] + sts_hp),
+                 data_len, sts_hp);
         pci_dma_write(pci_dev, s->ce_sts_base[ce_pipe] + sts_hp,
                       sts_desc, sts_esize);
+        {
+            uint32_t w0, w1, w2, w3;
+            pci_dma_read(pci_dev, s->ce_sts_base[ce_pipe] + sts_hp, &w0, 4);
+            pci_dma_read(pci_dev, s->ce_sts_base[ce_pipe] + sts_hp + 4, &w1, 4);
+            pci_dma_read(pci_dev, s->ce_sts_base[ce_pipe] + sts_hp + 8, &w2, 4);
+            pci_dma_read(pci_dev, s->ce_sts_base[ce_pipe] + sts_hp + 12, &w3, 4);
+            fprintf(stderr, "WCN: sts_desc written: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+                    w0, w1, w2, w3);
+        }
         sts_hp += sts_esize;
         if (s->ce_sts_size[ce_pipe] &&
             sts_hp >= s->ce_sts_size[ce_pipe])
             sts_hp = 0;
         s->ce_sts_hp[ce_pipe] = sts_hp;
 
-        /* RDP write-back: driver reads status HP from terms of RDP */
+        /* RDP write-back: driver reads status HP from the RDP slot, but the
+         * ath12k HAL treats cached_hp/tp/entry_size/ring_size in units of
+         * 4-byte WORDS (see hal.c:596 ath12k_hal_srng_setup).  sts_hp is kept
+         * in bytes for the ring offset, so convert to words here. */
         if (s->ce_sts_hp_addr[ce_pipe]) {
-            uint32_t sts_hp_le = cpu_to_le32(sts_hp);
+            uint32_t sts_hp_words = (sts_hp / sts_esize) * (sts_esize / 4);
+            uint32_t sts_hp_le = cpu_to_le32(sts_hp_words);
+            fprintf(stderr, "WCN: write sts_hp pipe=%d to 0x%lx val=%u (bytes %u)\n",
+                     ce_pipe, (unsigned long)s->ce_sts_hp_addr[ce_pipe],
+                     sts_hp_words, sts_hp);
             pci_dma_write(pci_dev, s->ce_sts_hp_addr[ce_pipe],
                           &sts_hp_le, sizeof(sts_hp_le));
+            {
+                uint32_t slot, sd[8];
+                int i;
+                pci_dma_read(pci_dev, s->ce_sts_hp_addr[ce_pipe], &slot, 4);
+                fprintf(stderr, "WCN: rdp slot now=0x%x (ce_sts_hp_words=%u, bytes=%u)\n",
+                        slot, sts_hp_words, sts_hp);
+                for (i = 0; i < 8; i++) {
+                    pci_dma_read(pci_dev, s->ce_sts_base[ce_pipe] + i * 16,
+                                 &sd[i], 4);
+                }
+                fprintf(stderr, "WCN: CE%d status ring[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                        ce_pipe, sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7]);
+            }
+            if (ce_pipe == 1) {
+                uint32_t s2slot, s2d[2];
+                pci_dma_read(pci_dev, s->ce_sts_hp_addr[2], &s2slot, 4);
+                pci_dma_read(pci_dev, s->ce_sts_base[2], &s2d[0], 4);
+                pci_dma_read(pci_dev, s->ce_sts_base[2] + 16, &s2d[1], 4);
+                fprintf(stderr, "WCN: CE2 sts_hp slot=0x%x base=0x%lx entry0=0x%08x entry1=0x%08x\n",
+                        s2slot, (unsigned long)s->ce_sts_base[2], s2d[0], s2d[1]);
+            }
         }
     }
 
-    /* Send MSI to notify the driver */
-    if (msivec >= 0) {
+    /* Send MSI to notify the driver (vector derived from the CE pipe,
+     * matching the ath12k driver's ath12k_pci_get_ce_msi_idx mapping) */
+    {
+        int msivec = wcn7850_ce_msi_vector(ce_pipe);
+        fprintf(stderr, "WCN: sending MSI %d for CE pipe %d\n", msivec, ce_pipe);
         msi_notify(pci_dev, msivec);
     }
 }
 
 /* Build and send a WMI_SERVICE_READY_EVENT to the driver */
+static void wcn7850_send_wmi_service_ready_ext(WCN7850State *s, PCIDevice *pci_dev);
+
 static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
 {
     uint8_t buf[512];
@@ -1207,8 +1403,8 @@ static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
     *(uint32_t *)(buf + off + 124)= cpu_to_le32(128);        /* num_msdu_desc */
     off += sre_len;
 
-    /* TLV: service bitmap (WMI_TAG_ARRAY_UINT32, len=128 for 32×uint32_t, all zeros) */
-    uint32_t bm_words = (128 + 31) / 32; /* WMI_MAX_SERVICE=128 → 4 words */
+    /* TLV: service bitmap (WMI_TAG_ARRAY_UINT32, 128 bytes = 32×uint32_t for WMI_MAX_SERVICE=128) */
+    uint32_t bm_words = 32; /* WMI_SERVICE_BM_SIZE = (128+3)/4 */
     uint32_t bm_len = bm_words * 4;
     tlv = (WmiTlv *)(buf + off);
     tlv->header = WMI_TLV_HDR(WMI_TAG_ARRAY_UINT32, bm_len);
@@ -1225,9 +1421,129 @@ static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
     hdr2->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*hdr2), buf, total_len);
 
-    wcn7850_wmi_send_event(s, pci_dev, s->htc_ep[HTC_EP_WMI].dl_pipe ?: 2,
-                            htc_buf, sizeof(*hdr2) + total_len, 0);
+    wcn7850_wmi_send_event(s, pci_dev, 1, /* HTC ctrl DL: ordered after connect resp so WMI ep rx_cb is registered */
+                            htc_buf, sizeof(*hdr2) + total_len);
+
+    wcn7850_send_wmi_service_ready_ext(s, pci_dev);
     s->wmi_service_ready_sent = true;
+}
+
+/* Build and send a WMI_SERVICE_READY_EXT_EVENT so the driver completes
+ * ab->wmi_ab.service_ready. Mirrors the firmware capability payload. */
+static void wcn7850_send_wmi_service_ready_ext(WCN7850State *s, PCIDevice *pci_dev)
+{
+    uint8_t buf[1024];
+    uint32_t off = 0;
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    WmiTlv *tlv;
+    uint8_t *p;
+
+    hdr->cmd_id = cpu_to_le32(WMI_SERVICE_READY_EXT_EVENTID);
+    off += sizeof(*hdr);
+
+    /* Helper to open a top-level TLV whose length is filled in once the
+     * content has been written (off-delta), so lengths always match bytes. */
+#define OPEN_TLV(_tag) do { \
+        tlv_start = off; \
+        tlv = (WmiTlv *)(buf + off); \
+        off += sizeof(*tlv); \
+    } while (0)
+#define CLOSE_TLV(_tag) do { \
+        tlv->header = WMI_TLV_HDR((_tag), off - (tlv_start + sizeof(*tlv))); \
+    } while (0)
+
+    /* 1) main ext struct */
+    uint32_t tlv_start;
+    OPEN_TLV(WMI_TAG_SERVICE_READY_EXT_EVENT);
+    memset(buf + off, 0, sizeof(WmiServiceReadyExt));
+    off += sizeof(WmiServiceReadyExt);
+    CLOSE_TLV(WMI_TAG_SERVICE_READY_EXT_EVENT);
+
+    /* 2) SOC_MAC_PHY_HW_MODE_CAPS */
+    OPEN_TLV(WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS);
+    {
+        WmiSocMacPhyHwModeCaps *c = (WmiSocMacPhyHwModeCaps *)(buf + off);
+        c->num_hw_modes = cpu_to_le32(1);
+        c->num_chainmask_tables = cpu_to_le32(1);
+    }
+    off += sizeof(WmiSocMacPhyHwModeCaps);
+    CLOSE_TLV(WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS);
+
+    /* 3) ARRAY_STRUCT: hw mode caps (1 entry). Content is the nested
+     * WmiHwModeCap TLV (which carries its own tlv_header). */
+    OPEN_TLV(WMI_TAG_ARRAY_STRUCT);
+    {
+        WmiHwModeCap *c = (WmiHwModeCap *)(buf + off);
+        c->tlv_header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_HW_MODE_CAPABILITIES,
+                                  sizeof(WmiHwModeCap) - sizeof(uint32_t)));
+        c->hw_mode_id = cpu_to_le32(WMI_HOST_HW_MODE_DBS);
+        c->phy_id_map = cpu_to_le32(0x1);
+        c->hw_mode_config_type = 0;
+    }
+    off += sizeof(WmiHwModeCap);
+    CLOSE_TLV(WMI_TAG_ARRAY_STRUCT);
+
+    /* 4) ARRAY_STRUCT: mac phy caps (1 entry). Content is the nested
+     * MAC_PHY_CAPABILITIES TLV (header + WmiMacPhyCaps). */
+    OPEN_TLV(WMI_TAG_ARRAY_STRUCT);
+    p = buf + off;
+    *(uint32_t *)p = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_MAC_PHY_CAPABILITIES,
+                                  sizeof(WmiMacPhyCaps)));
+    p += sizeof(uint32_t);
+    off += sizeof(uint32_t);   /* account for the separate nested header */
+    {
+        WmiMacPhyCaps *c = (WmiMacPhyCaps *)p;
+        memset(c, 0, sizeof(*c));
+        c->hw_mode_id = cpu_to_le32(WMI_HOST_HW_MODE_DBS);
+        c->pdev_and_hw_link_ids = 0;
+        c->phy_id = cpu_to_le32(0);
+        c->supported_bands = cpu_to_le32(WMI_HOST_WLAN_2GHZ_CAP |
+                                         WMI_HOST_WLAN_5GHZ_CAP);
+        c->wireless_modes = cpu_to_le32(0x1f);
+        c->low_2ghz_chan_freq = cpu_to_le32(2412);
+        c->high_2ghz_chan_freq = cpu_to_le32(2484);
+        c->low_5ghz_chan_freq = cpu_to_le32(5180);
+        c->high_5ghz_chan_freq = cpu_to_le32(5885);
+    }
+    off += sizeof(WmiMacPhyCaps);
+    CLOSE_TLV(WMI_TAG_ARRAY_STRUCT);
+    /* 5) SOC_HAL_REG_CAPABILITIES */
+    OPEN_TLV(WMI_TAG_SOC_HAL_REG_CAPABILITIES);
+    {
+        WmiSocHalRegCaps *c = (WmiSocHalRegCaps *)(buf + off);
+        c->num_phy = cpu_to_le32(1);
+    }
+    off += sizeof(WmiSocHalRegCaps);
+    CLOSE_TLV(WMI_TAG_SOC_HAL_REG_CAPABILITIES);
+
+    /* 6) ARRAY_STRUCT: ext hal reg caps (1 entry). Content is the nested
+     * WmiHalRegCapsExt TLV (carries its own tlv_header). */
+    OPEN_TLV(WMI_TAG_ARRAY_STRUCT);
+    {
+        WmiHalRegCapsExt *c = (WmiHalRegCapsExt *)(buf + off);
+        c->tlv_header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_HAL_REG_CAPABILITIES_EXT,
+                                  sizeof(WmiHalRegCapsExt) - sizeof(uint32_t)));
+        c->phy_id = cpu_to_le32(0);
+        c->low_2ghz_chan = cpu_to_le32(2412);
+        c->high_2ghz_chan = cpu_to_le32(2484);
+        c->low_5ghz_chan = cpu_to_le32(5180);
+        c->high_5ghz_chan = cpu_to_le32(5885);
+    }
+    off += sizeof(WmiHalRegCapsExt);
+    CLOSE_TLV(WMI_TAG_ARRAY_STRUCT);
+
+#undef OPEN_TLV
+#undef CLOSE_TLV
+
+    uint32_t total_len = off;
+
+    uint8_t htc_buf[2048];
+    HtcHdr *h2 = (HtcHdr *)htc_buf;
+    h2->hdr_info = cpu_to_le32(HTC_EP_WMI | (total_len << 16));
+    h2->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h2), buf, total_len);
+
+    wcn7850_wmi_send_event(s, pci_dev, 1, htc_buf, sizeof(*h2) + total_len);
 }
 
 /* Build and send a WMI_READY_EVENT to the driver */
@@ -1268,8 +1584,8 @@ static void wcn7850_send_wmi_ready(WCN7850State *s, PCIDevice *pci_dev)
     h2->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*h2), buf, total_len);
 
-    wcn7850_wmi_send_event(s, pci_dev, s->htc_ep[HTC_EP_WMI].dl_pipe ?: 2,
-                            htc_buf, sizeof(*h2) + total_len, 0);
+    wcn7850_wmi_send_event(s, pci_dev, 1, /* HTC ctrl DL: ordered after connect resp so WMI ep rx_cb is registered */
+                            htc_buf, sizeof(*h2) + total_len);
     s->wmi_ready_sent = true;
 }
 
@@ -1277,20 +1593,19 @@ static void wcn7850_send_wmi_ready(WCN7850State *s, PCIDevice *pci_dev)
 static void wcn7850_htc_send_ready(WCN7850State *s, PCIDevice *pci_dev)
 {
     uint8_t buf[64];
-    HtcReadyMsg *ready = (HtcReadyMsg *)buf;
-
-    ready->msg_id = cpu_to_le32(HTC_MSG_READY_ID);
-    ready->credits = cpu_to_le32(128);
-    ready->credit_size = cpu_to_le32(4096);
-    ready->max_ep = cpu_to_le32(HTC_EP_MAX);
-    ready->pad = 0;
-
     HtcHdr *hdr = (HtcHdr *)buf;
-    hdr->hdr_info = cpu_to_le32(0); /* EP 0, flags 0 */
+    hdr->hdr_info = cpu_to_le32((sizeof(uint32_t) * 2) << 16); /* EP 0, flags 0, payload_len */
     hdr->ctrl_info = cpu_to_le32(HTC_MSG_READY_ID);
 
+    /* Kernel struct ath12k_htc_ready:
+     *   id_credit_count: msg_id [15:0], credit_count [31:16]
+     *   size_ep:         credit_size [15:0], (ep info) [31:16] */
+    uint32_t *buf32 = (uint32_t *)(buf + sizeof(HtcHdr));
+    buf32[0] = cpu_to_le32(HTC_MSG_READY_ID | (128 << 16));  /* id_credit_count */
+    buf32[1] = cpu_to_le32(4096);                             /* size_ep */
+
     /* Send via CE dest ring (CE pipe 1 = HTC control DL) */
-    wcn7850_wmi_send_event(s, pci_dev, 1, buf, sizeof(*ready) + 0, 0);
+    wcn7850_wmi_send_event(s, pci_dev, 1, buf, sizeof(HtcHdr) + sizeof(uint32_t) * 2);
     s->htc_credits = 128;
 }
 
@@ -1302,15 +1617,28 @@ static void wcn7850_htc_handle_connect(WCN7850State *s, PCIDevice *pci_dev,
     uint16_t svc_id = HTC_CONN_SVC_ID(req);
     uint16_t msg_id = HTC_CONN_MSG_ID(req);
     uint8_t resp_buf[64];
-    HtcConnSvcResp *resp = (HtcConnSvcResp *)resp_buf;
     HtcHdr *hdr = (HtcHdr *)resp_buf;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->hdr_info = cpu_to_le32(sizeof(HtcConnSvcResp) << 16);
+    hdr->ctrl_info = cpu_to_le32(HTC_MSG_CONNECT_SERVICE_RESP_ID);
+
+    HtcConnSvcResp *resp = (HtcConnSvcResp *)(resp_buf + sizeof(HtcHdr));
 
     (void)msg_id;
 
     int ep = -1;
-    if (svc_id == 0x0401) { /* WMI service */
-        ep = HTC_EP_WMI;
-    } else {
+    int ul_pipe = 3, dl_pipe = 2;
+    switch (svc_id) {
+    case 0x0300: /* HTT data (host->target): SVC(HTT,0) */
+        ep = 1; ul_pipe = 4; dl_pipe = 1; break;
+    case 0x0100: /* WMI control: SVC(WMI,0) */
+        ep = HTC_EP_WMI; ul_pipe = 3; dl_pipe = 2; break;
+    case 0x0105: /* WMI control MAC1: SVC(WMI,5) */
+        ep = 3; ul_pipe = 3; dl_pipe = 2; break;
+    case 0x0106: /* WMI control MAC2: SVC(WMI,6) */
+        ep = 4; ul_pipe = 3; dl_pipe = 2; break;
+    default:
+        fprintf(stderr, "WCN: HTC connect unknown svc_id=0x%04x\n", svc_id);
         return;
     }
 
@@ -1320,26 +1648,18 @@ static void wcn7850_htc_handle_connect(WCN7850State *s, PCIDevice *pci_dev,
     /* Assign endpoint and record mapping */
     s->htc_ep[ep].connected = true;
     s->htc_ep[ep].service_id = svc_id;
-    s->htc_ep[ep].ul_pipe = 3;    /* WMI TX goes to CE pipe 3 */
-    s->htc_ep[ep].dl_pipe = 2;    /* WMI RX comes from CE pipe 2 */
+    s->htc_ep[ep].ul_pipe = ul_pipe;
+    s->htc_ep[ep].dl_pipe = dl_pipe;
 
     uint32_t msg_svc_id = (svc_id << 16) | HTC_MSG_CONNECT_SERVICE_RESP_ID;
     resp->msg_svc_id = cpu_to_le32(msg_svc_id);
     resp->flags_len = cpu_to_le32(0 | (ep << 8) | (4096 << 16));
 
-    memset(hdr, 0, sizeof(*hdr));
-    hdr->hdr_info = cpu_to_le32(0);
-    hdr->ctrl_info = cpu_to_le32(HTC_MSG_CONNECT_SERVICE_RESP_ID);
+    fprintf(stderr, "WCN: HTC connect svc=0x%04x -> ep=%d ul=%d dl=%d\n",
+            svc_id, ep, ul_pipe, dl_pipe);
 
     /* Send response via CE pipe 1 (HTC control DL) */
-    wcn7850_wmi_send_event(s, pci_dev, 1, resp_buf, sizeof(*resp) + 0, 0);
-
-    /* After WMI service connected, send WMI_SERVICE_READY */
-    if (svc_id == 0x0401) {
-        qemu_log("WCN: WMI connected on EP %d (ul=%d dl=%d)\n",
-                 ep, 3, 2);
-        wcn7850_send_wmi_service_ready(s, pci_dev);
-    }
+    wcn7850_wmi_send_event(s, pci_dev, 1, resp_buf, sizeof(HtcHdr) + sizeof(*resp));
 }
 
 /* Handle WMI command from driver (sent via HTC EP WMI_TX) */
@@ -1364,22 +1684,55 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
     }
 }
 
+/* Handle HTT command from driver (sent via HTC EP HTT on CE pipe 4).
+ * The only command during core bring-up is the version request; reply with
+ * HTT_T2H_MSG_TYPE_VERSION_CONF so the driver's htt_tgt_version_received
+ * completion fires. */
+static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
+                                   const uint8_t *payload, uint32_t len)
+{
+    if (len < 4) {
+        return;
+    }
+    uint32_t ver_reg_info = le32_to_cpu(*(const uint32_t *)payload);
+    uint32_t msg_type = ver_reg_info & 0xff;  /* HTT_VER_REQ_INFO_MSG_ID */
+
+    if (msg_type == 0) {  /* HTT_H2T_MSG_TYPE_VERSION_REQ */
+        uint8_t buf[16];
+        HtcHdr *hdr = (HtcHdr *)buf;
+        /* eid = 1 (HTT), payload_len = 4 */
+        hdr->hdr_info = cpu_to_le32((4 << 16) | 1);
+        hdr->ctrl_info = 0;
+        uint32_t *ver = (uint32_t *)(buf + sizeof(HtcHdr));
+        /* HTT_T2H_VERSION_CONF_MAJOR = bits 23..16, MINOR = bits 15..8 */
+        *ver = cpu_to_le32((3 << 16) | (0 << 8));  /* major 3, minor 0 */
+        /* Deliver on CE pipe 1 (HTT / HTC control DL). */
+        wcn7850_wmi_send_event(s, pci_dev, 1, buf, sizeof(HtcHdr) + 4);
+    }
+}
+
 /* Dispatch HTC message to appropriate handler */
 static void wcn7850_htc_dispatch(WCN7850State *s, PCIDevice *pci_dev,
                                   uint8_t epid, const uint8_t *payload,
                                   uint32_t len)
 {
+    fprintf(stderr, "WCN: htc_dispatch epid=%u len=%u\n", epid, len);
     switch (epid) {
     case HTC_EP_CTRL: {
         HtcHdr *hdr = (HtcHdr *)(payload - 8);
-        uint16_t msg_id = HTC_HDR_MSG_ID(hdr);
+        uint16_t msg_id = (payload[0] | (payload[1] << 8)) & 0x3f;
+        fprintf(stderr, "WCN: HTC ctrl msg_id=%u hdr_info=0x%08x ctrl_info=0x%08x\n",
+                msg_id, hdr->hdr_info, hdr->ctrl_info);
 
         switch (msg_id) {
         case HTC_MSG_SETUP_COMPLETE_EX_ID:
-            qemu_log("WCN: HTC setup complete\n");
-            wcn7850_htc_send_ready(s, pci_dev);
+            fprintf(stderr, "WCN: HTC setup complete\n");
+            /* Host sends setup complete only after all endpoint rx_cb's are
+             * registered. Now it is safe to deliver WMI service-ready events. */
+            s->wmi_service_ready_pending = true;
             break;
         case HTC_MSG_CONNECT_SERVICE_ID:
+            fprintf(stderr, "WCN: HTC connect svc\n");
             wcn7850_htc_handle_connect(s, pci_dev, payload);
             break;
         default:
@@ -1388,6 +1741,11 @@ static void wcn7850_htc_dispatch(WCN7850State *s, PCIDevice *pci_dev,
         }
         break;
     }
+    case 1: {  /* HTT endpoint */
+        wcn7850_handle_htt_cmd(s, pci_dev, payload, len);
+        break;
+    }
+    case HTC_EP_WMI:
     case HTC_EP_WMI_TX: {
         wcn7850_handle_wmi_cmd(s, pci_dev, payload, len);
         break;
@@ -1405,6 +1763,9 @@ static void wcn7850_htc_dispatch(WCN7850State *s, PCIDevice *pci_dev,
 static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
                                     int ce_pipe)
 {
+    qemu_log("WCN: process_ce_src pipe=%d tp=%u hp=%u base=0x%lx\n",
+             ce_pipe, s->ce_src_tp[ce_pipe], s->ce_src_hp[ce_pipe],
+             (unsigned long)s->ce_src_base[ce_pipe]);
     uint64_t base = s->ce_src_base[ce_pipe];
     uint32_t esize = s->ce_src_entry_size[ce_pipe] ?: 16;
     uint32_t ring_sz = s->ce_src_size[ce_pipe] ?: (WCN7850_CE_SRC_RING_SIZE * esize);
@@ -1414,6 +1775,9 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
     if (!base || !ring_sz)
         return;
 
+    if (tp != hp)
+        qemu_log("WCN: process_ce_src pipe=%d tp=%u hp=%u -> %d descs to process\n",
+                 ce_pipe, tp, hp, (hp >= tp ? hp - tp : ring_sz - tp + hp) / esize);
     while (tp != hp) {
         /* Read CE source descriptor */
         uint64_t desc_addr = base + tp;
@@ -1443,6 +1807,8 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
         /* Read the buffer data (contains HTC message) */
         uint8_t htc_buf[4096];
         if (pci_dma_read(pci_dev, buf_addr, htc_buf, buf_len) != MEMTX_OK) {
+            fprintf(stderr, "WCN: SRC buf read FAILED at 0x%lx len=%u\n",
+                    (unsigned long)buf_addr, buf_len);
             tp += esize;
             if (tp >= ring_sz) tp = 0;
             continue;
@@ -1452,6 +1818,9 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
         HtcHdr *htc_hdr = (HtcHdr *)htc_buf;
         uint8_t epid = HTC_HDR_EPID(htc_hdr);
         uint32_t payload_len = HTC_HDR_PAYLOAD_LEN(htc_hdr);
+        fprintf(stderr, "WCN: SRC desc at 0x%lx buf=0x%lx len=%u hdr=0x%08x ctrl=0x%08x\n",
+                (unsigned long)desc_addr, (unsigned long)buf_addr, buf_len,
+                htc_hdr->hdr_info, htc_hdr->ctrl_info);
         if (payload_len > buf_len - sizeof(*htc_hdr))
             payload_len = buf_len - sizeof(*htc_hdr);
 
@@ -1467,10 +1836,165 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
 
     /* Write TP back to shared memory so driver HP updates work */
     if (s->ce_src_tp_addr[ce_pipe]) {
-        uint32_t tp_le = cpu_to_le32(tp);
+        uint32_t tp_le = cpu_to_le32(tp / 4);
         pci_dma_write(pci_dev, s->ce_src_tp_addr[ce_pipe],
                       &tp_le, sizeof(tp_le));
     }
+}
+
+/* Decode a CE register access. win_off is the offset within the CE register
+ * window (addr & (WINDOW_SIZE - 1)). The per-pipe layout (stride 0x2000,
+ * destination block at +0x1000) matches the driver's HAL_CE_WFSS_CE_REG_BASE
+ * (0x01b80000) register map. Invoked both for the legacy dynamic window path
+ * (window_select routed to 0x37) and for the static CE window at BAR0 0x100000
+ * used when the driver sets static_window_map. */
+static void wcn7850_handle_ce_mmio(WCN7850State *s, PCIDevice *pci_dev,
+                                  hwaddr win_off, uint64_t val, unsigned size)
+{
+    int ce_pipe = -1;
+    bool is_dst = false;
+
+    if (win_off < WCN7850_CE_STRIDE * WCN7850_CE_COUNT) {
+        ce_pipe = win_off / WCN7850_CE_STRIDE;
+        if ((win_off % WCN7850_CE_STRIDE) >= 0x1000)
+            is_dst = true;
+    }
+
+    if (ce_pipe >= 0 && ce_pipe < WCN7850_CE_COUNT) {
+        hwaddr ce_blk_off = win_off % WCN7850_CE_STRIDE;
+        hwaddr blk = ce_blk_off % 0x1000;
+        if (ce_pipe == 2)
+            fprintf(stderr, "WCN: CE2 mmio win_off=0x%lx blk=0x%lx is_dst=%d val=0x%x\n",
+                    (unsigned long)win_off, (unsigned long)blk, is_dst,
+                    (uint32_t)val);
+
+        /* R0 config registers (base LSB/MSB + ring id) at offset 0x0 of the
+         * SRC or DST block (SRC block at +0x0, DST block at +0x1000). */
+        if (blk < 0x100) {
+            memcpy(s->window_memory + win_off, &val, size);
+            hwaddr cfg_base = win_off - blk;
+            uint32_t base_lsb_cfg, base_msb_cfg, ring_id_cfg;
+            base_lsb_cfg = *(uint32_t *)(s->window_memory + cfg_base +
+                                        WCN7850_CE_RING_BASE_LSB);
+            base_msb_cfg = *(uint32_t *)(s->window_memory + cfg_base +
+                                        WCN7850_CE_RING_BASE_MSB);
+            ring_id_cfg  = *(uint32_t *)(s->window_memory + cfg_base +
+                                        WCN7850_CE_RING_ID);
+            if (base_lsb_cfg || base_msb_cfg) {
+                uint64_t base_addr = base_lsb_cfg |
+                    ((uint64_t)(base_msb_cfg & 0xff) << 32);
+                uint32_t ring_sz = (base_msb_cfg >> 8) & 0xffff;
+                uint32_t entry_size = (ring_id_cfg & 0xff) * 4;
+                if (!entry_size) entry_size = 16;
+                if (!ring_sz) ring_sz = 512 * entry_size;
+                /* host address where the device writes its pointer
+                 * (TP for SRC, HP for DST) - CE_RING_HP_ADDR at +0x1c/+0x20. */
+                uint32_t hp_addr_lsb = *(uint32_t *)(s->window_memory +
+                    cfg_base + WCN7850_CE_RING_HP_ADDR_LSB);
+                uint32_t hp_addr_msb = *(uint32_t *)(s->window_memory +
+                    cfg_base + WCN7850_CE_RING_HP_ADDR_MSB);
+                uint64_t hp_addr = hp_addr_lsb |
+                    ((uint64_t)(hp_addr_msb & 0xff) << 32);
+                uint32_t ring_sz_bytes = ring_sz * entry_size;
+                if (is_dst) {
+                    s->ce_dst_base[ce_pipe] = base_addr;
+                    s->ce_dst_size[ce_pipe] = ring_sz_bytes;
+                    s->ce_dst_entry_size[ce_pipe] = entry_size;
+                    if (hp_addr)
+                        s->ce_dst_hp_addr[ce_pipe] = hp_addr;
+                    fprintf(stderr, "WCN: CE dst cfg pipe=%d base=0x%lx sz=%u esz=%u\n",
+                             ce_pipe, (unsigned long)base_addr, ring_sz_bytes, entry_size);
+                } else {
+                    s->ce_src_base[ce_pipe] = base_addr;
+                    s->ce_src_size[ce_pipe] = ring_sz_bytes;
+                    s->ce_src_entry_size[ce_pipe] = entry_size;
+                    if (hp_addr)
+                        s->ce_src_tp_addr[ce_pipe] = hp_addr;
+                    qemu_log("WCN: CE src cfg pipe=%d base=0x%lx sz=%u esz=%u tp_addr=0x%lx\n",
+                             ce_pipe, (unsigned long)base_addr, ring_sz_bytes,
+                             entry_size, (unsigned long)hp_addr);
+                }
+                /* DST status ring config at +0x58..+0x70 */
+                if (is_dst) {
+                    uint32_t sts_lsb = *(uint32_t *)(s->window_memory +
+                        cfg_base + 0x58);
+                    uint32_t sts_msb = *(uint32_t *)(s->window_memory +
+                        cfg_base + 0x5c);
+                    if (sts_lsb || sts_msb) {
+                        s->ce_sts_base[ce_pipe] = sts_lsb |
+                            ((uint64_t)(sts_msb & 0xff) << 32);
+                        uint32_t sts_rind = *(uint32_t *)(s->window_memory +
+                            cfg_base + 0x60);
+                        uint32_t sts_entry_size = (sts_rind & 0xff) * 4;
+                        if (!sts_entry_size) sts_entry_size = 16;
+                        s->ce_sts_size[ce_pipe] = ((sts_msb >> 8) & 0xffff) * sts_entry_size;
+                        s->ce_sts_entry_size[ce_pipe] = sts_entry_size;
+                        uint32_t st_hp_lsb = *(uint32_t *)(s->window_memory +
+                            cfg_base + 0x6c);
+                        uint32_t st_hp_msb = *(uint32_t *)(s->window_memory +
+                            cfg_base + 0x70);
+                        s->ce_sts_hp_addr[ce_pipe] = st_hp_lsb |
+                            ((uint64_t)(st_hp_msb & 0xff) << 32);
+                        fprintf(stderr, "WCN: CE%d sts base=0x%lx sz=%u esz=%u hp_addr=0x%lx\n",
+                                ce_pipe,
+                                (unsigned long)s->ce_sts_base[ce_pipe],
+                                s->ce_sts_size[ce_pipe],
+                                s->ce_sts_entry_size[ce_pipe],
+                                (unsigned long)s->ce_sts_hp_addr[ce_pipe]);
+                    }
+                }
+            }
+            return;
+        }
+
+        /* R2 pointer registers: HP/TP at +0x400/+0x404 (status HP at +0x408),
+         * within the SRC or DST block. */
+        if (blk >= WCN7850_CE_RING_HP_OFFSET &&
+            blk < WCN7850_CE_RING_HP_OFFSET + 0x10) {
+            memcpy(s->window_memory + win_off, &val, size);
+            fprintf(stderr, "WCN: R2 win_off=0x%lx blk=0x%lx pipe=%d is_dst=%d val=0x%x\n",
+                    (unsigned long)win_off, (unsigned long)blk, ce_pipe,
+                    is_dst, (uint32_t)val);
+            if (blk == WCN7850_CE_RING_HP_OFFSET) {
+                if (is_dst) {
+                    s->ce_dst_hp[ce_pipe] = val;
+                    int wmi_dl = s->htc_ep[HTC_EP_WMI].dl_pipe ?: 2;
+                    if (ce_pipe == wmi_dl) {
+                        uint32_t ring_sz = s->ce_dst_size[ce_pipe] ?:
+                            (WCN7850_CE_DST_RING_SIZE *
+                             (s->ce_dst_entry_size[ce_pipe] ?: 16));
+                        uint32_t esize = s->ce_dst_entry_size[ce_pipe] ?: 16;
+                        uint32_t doorbell_bytes = val * 4;
+                        uint32_t prev = s->ce_dst_drv_hp_prev[ce_pipe];
+                        if (doorbell_bytes != prev) {
+                            uint32_t delta = (doorbell_bytes - prev
+                                             + ring_sz) % ring_sz;
+                            s->ce_dst_pending[ce_pipe] += delta / esize;
+                        }
+                        s->ce_dst_drv_hp_prev[ce_pipe] = doorbell_bytes;
+                        s->ce_dst_drv_hp[ce_pipe] = doorbell_bytes;
+                        fprintf(stderr, "WCN: CE-win DST HP pipe=%d val=0x%x pending=%u\n",
+                                ce_pipe, val, s->ce_dst_pending[ce_pipe]);
+                    }
+                } else {
+                    qemu_log("WCN: CE-dir HP pipe=%d val=0x%x\n", ce_pipe, (uint32_t)val);
+                    s->ce_src_hp[ce_pipe] = val * 4;
+                    wcn7850_process_ce_src(s, pci_dev, ce_pipe);
+                }
+            } else if (blk == WCN7850_CE_RING_TP_OFFSET) {
+                if (is_dst)
+                    s->ce_dst_tp[ce_pipe] = val * 4;
+                else
+                    s->ce_src_tp[ce_pipe] = val * 4;
+            } else if (blk == (WCN7850_CE_RING_HP_OFFSET + 8)) {
+                if (is_dst)
+                    s->ce_sts_hp[ce_pipe] = val;
+            }
+            return;
+        }
+    }
+
+    memcpy(s->window_memory + win_off, &val, size);
 }
 
 /* ===== QRTR/QMI handler ===== */
@@ -1874,7 +2398,9 @@ static void wcn7850_process_qmi(WCN7850State *s, PCIDevice *pci_dev,
         break;
     case QMI_WLFW_M3_INFO_REQ:
         resp_len = wcn7850_qmi_build_resp(resp_buf, sizeof(resp_buf), txn_id, msg_id, 1);
-        /* After M3 info, send FW_READY_IND to signal firmware is ready */
+        /* After M3 info, send FW_READY_IND. The driver's wlan_enable /
+         * core_start is itself triggered by FW_READY_IND, so it must be
+         * sent before the driver attempts WLAN_CFG/WLAN_MODE. */
         s->qmi_pending_ind = QMI_WLFW_FW_READY_IND;
         break;
     case QMI_WLFW_WLAN_INI_REQ:
@@ -1934,6 +2460,38 @@ static void wcn7850_process_qmi(WCN7850State *s, PCIDevice *pci_dev,
 }
 
 /* Process a QRTR packet from the host */
+/* Send QRTR RESUME_TX to unblock the host's flow control when
+ * QRTR_TX_FLOW_HIGH (10 pending credits) is reached. */
+static bool wcn7850_send_resume_tx(WCN7850State *s, PCIDevice *pci_dev,
+                                    uint64_t ch_ctxt_addr,
+                                    uint64_t er_ctxt_addr)
+{
+    uint8_t buf[sizeof(QrtrHdrV1) + sizeof(QrtrCtrlPkt)];
+    QrtrHdrV1 *hdr = (QrtrHdrV1 *)buf;
+    QrtrCtrlPkt *ctrl = (QrtrCtrlPkt *)(buf + sizeof(QrtrHdrV1));
+    uint64_t dl_ctxt_addr;
+
+    memset(buf, 0, sizeof(buf));
+
+    hdr->version = cpu_to_le32(QRTR_PROTO_VER_1);
+    hdr->type = cpu_to_le32(QRTR_TYPE_RESUME_TX);
+    hdr->src_node_id = cpu_to_le32(QRTR_NODE_FW);
+    hdr->src_port_id = cpu_to_le32(QRTR_PORT_QMI_SERVICE);
+    hdr->confirm_rx = 0;
+    hdr->size = cpu_to_le32(sizeof(QrtrCtrlPkt));
+    hdr->dst_node_id = cpu_to_le32(QRTR_NODE_HOST);
+    hdr->dst_port_id = cpu_to_le32(QRTR_PORT_CTRL);
+
+    /* client.node/client.port overlap server_service/server_instance */
+    ctrl->cmd = cpu_to_le32(QRTR_TYPE_RESUME_TX);
+    ctrl->server_service = cpu_to_le32(QRTR_NODE_FW);
+    ctrl->server_instance = cpu_to_le32(QRTR_PORT_QMI_SERVICE);
+
+    dl_ctxt_addr = ch_ctxt_addr + MHI_CHAN_IPCR_DL * sizeof(MhiChanCtxt);
+    return wcn7850_write_dl_data(s, pci_dev, dl_ctxt_addr, er_ctxt_addr, 0,
+                                  buf, sizeof(buf));
+}
+
 static void wcn7850_process_qrtr(WCN7850State *s, PCIDevice *pci_dev,
                                    uint64_t ch_ctxt_addr,
                                    uint64_t er_ctxt_addr,
@@ -1949,11 +2507,18 @@ static void wcn7850_process_qrtr(WCN7850State *s, PCIDevice *pci_dev,
     uint32_t type = le32_to_cpu(hdr->type);
     uint32_t src_node = le32_to_cpu(hdr->src_node_id);
     uint32_t src_port = le32_to_cpu(hdr->src_port_id);
+    uint32_t confirm_rx = le32_to_cpu(hdr->confirm_rx);
     uint32_t payload_size = le32_to_cpu(hdr->size);
     const uint8_t *payload = data + sizeof(*hdr);
 
     (void)src_node;
     (void)src_port;
+
+    /* If host asks us to confirm receipt, send RESUME_TX to unblock flow */
+    if (confirm_rx) {
+        qemu_log("WCN: QRTR confirm_rx -> send RESUME_TX\n");
+        wcn7850_send_resume_tx(s, pci_dev, ch_ctxt_addr, er_ctxt_addr);
+    }
 
     qemu_log("WCN: QRTR type=%u src=%u:%u size=%u\n",
              type, src_node, src_port, payload_size);
@@ -1972,6 +2537,11 @@ static void wcn7850_process_qrtr(WCN7850State *s, PCIDevice *pci_dev,
         wcn7850_process_qmi(s, pci_dev, ch_ctxt_addr, er_ctxt_addr, er_index,
                              src_node, src_port,
                              payload, payload_size);
+        break;
+    case QRTR_TYPE_RESUME_TX:
+        /* Host sent us RESUME_TX — flow from model→host is unblocked.
+         * We don't maintain pending counters, so nothing to do. */
+        qemu_log("WCN: received RESUME_TX (ignored)\n");
         break;
     default:
         qemu_log("WCN: unhandled QRTR type %u\n", type);
@@ -2086,6 +2656,16 @@ static void wcn7850_process_ul_data(WCN7850State *s, PCIDevice *pci_dev,
             }
         }
 
+        /* Post a transfer-completion event for the consumed UL TRE so the
+         * host can recover/reuse the TRE. Without this the host's UL ring
+         * fills up and further requests (e.g. WLAN_MODE) can never be
+         * queued. */
+        if (ch_id == MHI_CHAN_IPCR_UL) {
+            uint64_t tre_addr = ctxt.rp;
+            wcn7850_post_transfer_event(s, pci_dev, er_ctxt_addr, ctxt.erindex,
+                                        MHI_CHAN_IPCR_UL, tre_addr, len);
+        }
+
         g_free(buf);
 
         /* Advance rp */
@@ -2095,6 +2675,15 @@ static void wcn7850_process_ul_data(WCN7850State *s, PCIDevice *pci_dev,
     }
 
     wcn7850_write_chan_ctxt(pci_dev, ch_ctxt_addr, &ctxt);
+
+    /* Proactively send RESUME_TX so the host's QRTR flow control does
+     * not stall at QRTR_TX_FLOW_HIGH (10) before the next QMI request
+     * (e.g. WLAN_MODE) can be sent.  The host sets confirm_rx on every
+     * LOW-th packet, but if those have already been processed we must
+     * send one unconditionally to unblock any waiter. */
+    if (ch_id == MHI_CHAN_IPCR_UL && s->chan_ctxt_addr) {
+        wcn7850_send_resume_tx(s, pci_dev, s->chan_ctxt_addr, er_ctxt_addr);
+    }
 }
 
 /* Send QRTR NEW_SERVER to announce QMI service */
@@ -2333,9 +2922,14 @@ static uint64_t wcn7850_mmio_read(void *opaque, hwaddr addr, unsigned size)
         goto done;
     }
 
-    if (addr < WCN7850_WINDOW_START + WCN7850_WINDOW_SIZE) {
-        win_off = addr - WCN7850_WINDOW_START;
-        if (s->window_select == WCN7850_WINDOW_TCSR_SEL &&
+    if (addr < WCN7850_WINDOW_START + WCN7850_WINDOW_SIZE ||
+        (addr >= WCN7850_CE_WINDOW_BASE &&
+         addr < WCN7850_CE_WINDOW_BASE + WCN7850_WINDOW_SIZE) ||
+        (addr >= WCN7850_UMAC_WINDOW_BASE &&
+         addr < WCN7850_UMAC_WINDOW_BASE + WCN7850_WINDOW_SIZE)) {
+        win_off = addr & (WCN7850_WINDOW_SIZE - 1);
+        if (addr < WCN7850_WINDOW_START + WCN7850_WINDOW_SIZE &&
+            s->window_select == WCN7850_WINDOW_TCSR_SEL &&
             win_off == (WCN7850_TCSR_SOC_HW_VERSION & (WCN7850_WINDOW_SIZE - 1))) {
             ret = 0x200;
         } else {
@@ -2463,6 +3057,59 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
         return;
     }
 
+    /* ===== Shadow register doorbells (0x8fc + 4*n) =====
+     * Must be checked BEFORE the TCL/REO SRNG intercept below: the driver's
+     * CE shadow indices live in block 1 (sidx 29..), and some of those
+     * addresses collide with TCL ring R0 config registers (e.g. sidx 35 =
+     * 0x988 == WCN7850_TCL_RING_MISC(1)). Block 0 (sidx 0..6) aliases the
+     * TCL/REO R0 config space, so those are NOT CE doorbells and are left
+     * for the SRNG intercept further down (unmapped shadow addrs fall
+     * through to it). */
+    if (addr >= WCN7850_SHADOW_BASE &&
+        addr < WCN7850_SHADOW_BASE + WCN7850_SHADOW_MAX * 4) {
+        memcpy(s->bar0_always_on + addr, &val, size);
+        unsigned int sidx = (addr - WCN7850_SHADOW_BASE) / 4;
+        int ce_pipe = -1;
+        int ce_type = -1;
+        if (sidx == 29) { ce_pipe = 0; ce_type = 0; }
+        else if (sidx == 30) { ce_pipe = 1; ce_type = 1; }
+        else if (sidx == 31) { ce_pipe = 1; ce_type = 2; }
+        else if (sidx == 32) { ce_pipe = 2; ce_type = 1; }
+        else if (sidx == 33) { ce_pipe = 2; ce_type = 2; }
+        else if (sidx == 34) { ce_pipe = 3; ce_type = 0; }
+        else if (sidx == 35) { ce_pipe = 4; ce_type = 0; }
+        if (ce_pipe >= 0) {
+            uint32_t doorbell_val = val;
+            if (ce_type == 0) {
+                s->ce_src_hp[ce_pipe] = doorbell_val * 4;
+                wcn7850_process_ce_src(s, pci_dev, ce_pipe);
+            } else if (ce_type == 1) {
+                uint32_t prev_bytes = s->ce_dst_drv_hp_prev[ce_pipe];
+                uint32_t doorbell_bytes = doorbell_val * 4;
+                s->ce_dst_drv_hp[ce_pipe] = doorbell_bytes;
+                fprintf(stderr, "WCN: DST doorbell pipe=%d val=0x%x pending=%u seen=%d\n",
+                        ce_pipe, doorbell_val, s->ce_dst_pending[ce_pipe],
+                        s->ce_dst_doorbell_seen[ce_pipe]);
+                if (!s->ce_dst_doorbell_seen[ce_pipe]) {
+                    s->ce_dst_doorbell_seen[ce_pipe] = true;
+                    s->ce_dst_pending[ce_pipe] = (s->ce_dst_size[ce_pipe] ?:
+                        (WCN7850_CE_DST_RING_SIZE * (s->ce_dst_entry_size[ce_pipe] ?: 16)))
+                        / (s->ce_dst_entry_size[ce_pipe] ?: 16);
+                } else if (doorbell_bytes != prev_bytes) {
+                    uint32_t ring_sz = s->ce_dst_size[ce_pipe] ?:
+                        (WCN7850_CE_DST_RING_SIZE * (s->ce_dst_entry_size[ce_pipe] ?: 16));
+                    uint32_t delta = (doorbell_bytes - prev_bytes + ring_sz) % ring_sz;
+                    s->ce_dst_pending[ce_pipe] += delta / (s->ce_dst_entry_size[ce_pipe] ?: 16);
+                }
+                s->ce_dst_drv_hp_prev[ce_pipe] = doorbell_bytes;
+            } else if (ce_type == 2) {
+            }
+            return;
+        }
+        /* Unmapped shadow address (e.g. TCL/REO R0 config aliased into this
+         * range): fall through to the SRNG intercept below. */
+    }
+
     /* ===== SRNG register intercept ===== */
     /* TCL ring config registers (R0) */
     for (int i = 0; i < WCN7850_NUM_TCL_RINGS; i++) {
@@ -2537,163 +3184,45 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
         }
     }
 
-    /* Shadow register doorbells (0x8fc + 4*n).
-     * CE DST is SRC_DIR → driver writes HP (producer) via shadow.
-     * CE DST STATUS is DST_DIR → driver writes TP (consumer) via shadow.
-     * Shadow order per WCN7850 CE init order:
-     *   idx 0: CE0 src HP
-     *   idx 1: CE1 dst HP (CE DST configured as SRC_DIR)
-     *   idx 2: CE1 dst status TP
-     *   idx 3: CE2 dst HP (CE DST configured as SRC_DIR)
-     *   idx 4: CE2 dst status TP
-     *   idx 5: CE3 src HP
-     */
-    if (addr >= WCN7850_SHADOW_BASE &&
-        addr < WCN7850_SHADOW_BASE + WCN7850_SHADOW_MAX * 4) {
-        memcpy(s->bar0_always_on + addr, &val, size);
-        unsigned int sidx = (addr - WCN7850_SHADOW_BASE) / 4;
-        int ce_pipe = -1;
-        int ce_type = -1; /* 0=src HP, 1=dst HP, 2=dst status TP */
-        if (sidx == 0) { ce_pipe = 0; ce_type = 0; }
-        else if (sidx == 1) { ce_pipe = 1; ce_type = 1; } /* CE1 dst HP */
-        else if (sidx == 2) { ce_pipe = 1; ce_type = 2; } /* CE1 dst status TP */
-        else if (sidx == 3) { ce_pipe = 2; ce_type = 1; } /* CE2 dst HP */
-        else if (sidx == 4) { ce_pipe = 2; ce_type = 2; } /* CE2 dst status TP */
-        else if (sidx == 5) { ce_pipe = 3; ce_type = 0; } /* CE3 src HP */
-        if (ce_pipe >= 0) {
-            uint32_t doorbell_val = val;
-            if (ce_type == 0) {
-                s->ce_src_hp[ce_pipe] = doorbell_val;
-                wcn7850_process_ce_src(s, pci_dev, ce_pipe);
-            } else if (ce_type == 1) {
-                /* Driver produced new entries in the CE DST ring.
-                 * CE DST is SRC_DIR: driver writes HP via shadow.
-                 * Track pending entries to handle HP wrap to 0. */
-                uint32_t prev_hp = s->ce_dst_drv_hp_prev[ce_pipe];
-                s->ce_dst_drv_hp[ce_pipe] = doorbell_val;
-                if (!s->ce_dst_doorbell_seen[ce_pipe]) {
-                    s->ce_dst_doorbell_seen[ce_pipe] = true;
-                    /* First doorbell: assume full ring */
-                    s->ce_dst_pending[ce_pipe] = (s->ce_dst_size[ce_pipe] ?:
-                        (WCN7850_CE_DST_RING_SIZE * (s->ce_dst_entry_size[ce_pipe] ?: 16)))
-                        / (s->ce_dst_entry_size[ce_pipe] ?: 16);
-                } else if (doorbell_val != prev_hp) {
-                    uint32_t ring_sz = s->ce_dst_size[ce_pipe] ?:
-                        (WCN7850_CE_DST_RING_SIZE * (s->ce_dst_entry_size[ce_pipe] ?: 16));
-                    uint32_t delta = (doorbell_val - prev_hp + ring_sz) % ring_sz;
-                    s->ce_dst_pending[ce_pipe] += delta / (s->ce_dst_entry_size[ce_pipe] ?: 16);
-                }
-                s->ce_dst_drv_hp_prev[ce_pipe] = doorbell_val;
-            } else if (ce_type == 2) {
-                /* Driver consumed status entries: no action needed */
-            }
-        }
-        return;
-    }
+
 
     if (addr < WCN7850_WINDOW_START) {
         memcpy(s->bar0_always_on + addr, &val, size);
         return;
     }
 
-    /* Window region: decode based on window_select */
-    if (addr < WCN7850_WINDOW_START + WCN7850_WINDOW_SIZE) {
-        hwaddr win_off = addr - WCN7850_WINDOW_START;
+    /* Static windows (driver sets static_window_map): CE -> 0x100000,
+     * UMAC -> 0x180000, accessed directly without the window register. */
+    if (addr >= WCN7850_UMAC_WINDOW_BASE &&
+        addr < WCN7850_UMAC_WINDOW_BASE + WCN7850_WINDOW_SIZE) {
+        qemu_log("WCN: UMAC win write addr=0x%lx off=0x%lx val=0x%x sz=%u\n",
+                 (unsigned long)addr, (unsigned long)(addr & (WCN7850_WINDOW_SIZE - 1)),
+                 (uint32_t)val, size);
+        memcpy(s->window_memory + (addr & (WCN7850_WINDOW_SIZE - 1)), &val, size);
+        return;
+    }
+    if (addr >= WCN7850_CE_WINDOW_BASE &&
+        addr < WCN7850_CE_WINDOW_BASE + WCN7850_WINDOW_SIZE) {
+        qemu_log("WCN: CE win write addr=0x%lx off=0x%lx val=0x%x sz=%u\n",
+                 (unsigned long)addr, (unsigned long)(addr & (WCN7850_WINDOW_SIZE - 1)),
+                 (uint32_t)val, size);
+        wcn7850_handle_ce_mmio(s, pci_dev, addr & (WCN7850_WINDOW_SIZE - 1),
+                               val, size);
+        return;
+    }
 
-        /* CE registers: window_select = WCN7850_CE0_SRC_BASE / WCN7850_WINDOW_SIZE */
-        if (s->window_select == (WCN7850_CE0_SRC_BASE / WCN7850_WINDOW_SIZE)) {
-            /* Determine CE pipe (0..8) from window offset */
-            int ce_pipe = -1;
-            bool is_dst = false;
-            if (win_off < WCN7850_CE_STRIDE * WCN7850_CE_COUNT) {
-                ce_pipe = win_off / WCN7850_CE_STRIDE;
-                /* dest rings are at offset 0x1000 within each CE block */
-                if ((win_off % WCN7850_CE_STRIDE) >= 0x1000) {
-                    is_dst = true;
-                }
-            }
-
-            if (ce_pipe >= 0 && ce_pipe < WCN7850_CE_COUNT) {
-                hwaddr ce_blk_off = win_off % WCN7850_CE_STRIDE;
-                /* R0 config registers (within first 0x100 of CE block for src,
-                   0x100 offset within CE block for dest) */
-                if (ce_blk_off < 0x100) {
-                    memcpy(s->window_memory + win_off, &val, size);
-                    /* Read all config registers for this CE block */
-                    uint32_t base_lsb_cfg, base_msb_cfg, ring_id_cfg;
-                    hwaddr cfg_base_src = win_off - ce_blk_off;
-                    if (is_dst) {
-                        /* For dest: remove the 0x1000 offset within CE block */
-                        cfg_base_src = (win_off - ce_blk_off) - 0x1000;
-                    }
-                    base_lsb_cfg = *(uint32_t *)(s->window_memory + cfg_base_src + WCN7850_CE_RING_BASE_LSB);
-                    base_msb_cfg = *(uint32_t *)(s->window_memory + cfg_base_src + WCN7850_CE_RING_BASE_MSB);
-                    ring_id_cfg  = *(uint32_t *)(s->window_memory + cfg_base_src + WCN7850_CE_RING_ID);
-
-                    if (base_lsb_cfg || base_msb_cfg) {
-                        uint64_t base_addr = base_lsb_cfg |
-                            ((uint64_t)(base_msb_cfg & 0xff) << 32);
-                        uint32_t ring_sz = (base_msb_cfg >> 8) & 0xffff;
-                        uint32_t entry_size = (ring_id_cfg & 0xff) * 4;
-                        if (!entry_size) entry_size = 16;
-                        if (!ring_sz) ring_sz = 512 * entry_size;
-                        if (is_dst) {
-                            s->ce_dst_base[ce_pipe] = base_addr;
-                            s->ce_dst_size[ce_pipe] = ring_sz;
-                            s->ce_dst_entry_size[ce_pipe] = entry_size;
-                            /* Also check for CE dst status ring config at offset 0x58 */
-                            uint32_t sts_lsb = *(uint32_t *)(s->window_memory + cfg_base_src + 0x58);
-                            uint32_t sts_msb = *(uint32_t *)(s->window_memory + cfg_base_src + 0x5c);
-                            if (sts_lsb || sts_msb) {
-                                s->ce_sts_base[ce_pipe] = sts_lsb |
-                                    ((uint64_t)(sts_msb & 0xff) << 32);
-                                uint32_t sts_rind = *(uint32_t *)(s->window_memory + cfg_base_src + 0x60);
-                                 s->ce_sts_size[ce_pipe] = (sts_msb >> 8) & 0xffff;
-                                 s->ce_sts_entry_size[ce_pipe] = (sts_rind & 0xff) * 4;
-                                 /* Capture status ring HP RDP address at offset 0x6C and 0x70 */
-                                 uint32_t hp_lsb = *(uint32_t *)(s->window_memory + cfg_base_src + 0x6c);
-                                 uint32_t hp_msb = *(uint32_t *)(s->window_memory + cfg_base_src + 0x70);
-                                 s->ce_sts_hp_addr[ce_pipe] = hp_lsb |
-                                     ((uint64_t)(hp_msb & 0xff) << 32);
-                             }
-                        } else {
-                            s->ce_src_base[ce_pipe] = base_addr;
-                            s->ce_src_size[ce_pipe] = ring_sz;
-                            s->ce_src_entry_size[ce_pipe] = entry_size;
-                        }
-                    }
-                    return;
-                }
-                /* R2 pointer registers (HP/TP at offset 0x400/0x404) */
-                if (ce_blk_off >= WCN7850_CE_RING_HP_OFFSET &&
-                    ce_blk_off < WCN7850_CE_RING_HP_OFFSET + 0x10) {
-                    memcpy(s->window_memory + win_off, &val, size);
-                    /* These are the actual HW HP/TP - also stored as shadow regs */
-                    if (ce_blk_off == WCN7850_CE_RING_HP_OFFSET) {
-                        if (is_dst) {
-                            s->ce_dst_hp[ce_pipe] = val;
-                        } else {
-                            s->ce_src_hp[ce_pipe] = val;
-                            /* Process CE source ring when HP advances */
-                            wcn7850_process_ce_src(s, pci_dev, ce_pipe);
-                        }
-                    } else if (ce_blk_off == WCN7850_CE_RING_TP_OFFSET) {
-                        if (is_dst) {
-                            s->ce_dst_tp[ce_pipe] = val;
-                        } else {
-                            s->ce_src_tp[ce_pipe] = val;
-                        }
-                    } else if (ce_blk_off == (WCN7850_CE_RING_HP_OFFSET + 8)) {
-                        /* Status ring HP at CE dest block offset 0x408 */
-                        if (is_dst) {
-                            s->ce_sts_hp[ce_pipe] = val;
-                        }
-                    }
-                    return;
-                }
-            }
+    /* Dynamic window region at 0x80000, selected via the window register. */
+    if (addr >= WCN7850_WINDOW_START &&
+        addr < WCN7850_WINDOW_START + WCN7850_WINDOW_SIZE) {
+        uint32_t win_off = addr - WCN7850_WINDOW_START;
+        if (s->window_select == WCN7850_WINDOW_TCSR_SEL &&
+            win_off == (WCN7850_TCSR_SOC_HW_VERSION & (WCN7850_WINDOW_SIZE - 1))) {
+            return; /* TCSR is read-only */
         }
-
+        if (s->window_select == (WCN7850_CE0_SRC_BASE / WCN7850_WINDOW_SIZE)) {
+            wcn7850_handle_ce_mmio(s, pci_dev, win_off, val, size);
+            return;
+        }
         memcpy(s->window_memory + win_off, &val, size);
         return;
     }
@@ -2773,10 +3302,6 @@ static void wcn7850_ce_poll_timer(void *opaque)
             if (read_ok)
                 rp_ne_wp = dl_ctxt.rp != dl_ctxt.wp;
         }
-        if (!has_chan || !read_ok || !rp_ne_wp) {
-            fprintf(stderr, "WCN: ce_poll retry_NS check has_chan=%d read_ok=%d rp_ne_wp=%d\n",
-                    has_chan, read_ok, rp_ne_wp);
-        }
         if (has_chan && read_ok && rp_ne_wp) {
             fprintf(stderr, "WCN: DL ring has buffers, retrying NEW_SERVER\n");
             if (wcn7850_send_new_server(s, pci_dev, s->chan_ctxt_addr,
@@ -2805,8 +3330,34 @@ static void wcn7850_ce_poll_timer(void *opaque)
     if (!s->ce_ready)
         goto reschedule;
 
+    if (!s->htc_ready_sent) {
+        if (s->ce_dst_base[1] && s->ce_dst_pending[1]) {
+            qemu_log("WCN: sending HTC ready\n");
+            wcn7850_htc_send_ready(s, pci_dev);
+            s->htc_ready_sent = true;
+        }
+    }
+
+    if (s->wmi_service_ready_pending && !s->wmi_ready_sent) {
+        int wmi_dl = s->htc_ep[HTC_EP_WMI].dl_pipe ?: 2;
+        if (s->ce_dst_base[wmi_dl]) {
+            qemu_log("WCN: sending WMI service ready (dl pipe %d)\n", wmi_dl);
+            wcn7850_send_wmi_service_ready(s, pci_dev);
+            s->wmi_service_ready_pending = false;
+        }
+    }
+
     for (int i = 0; i < WCN7850_CE_COUNT; i++) {
-        if (s->ce_src_base[i] && s->ce_src_hp[i] != s->ce_src_tp[i]) {
+        if (!s->ce_src_base[i])
+            continue;
+        /* Refresh HP from the ring's shared write-index so polled CE pipes
+         * (e.g. HTT on pipe 4) are serviced even without a doorbell. */
+        if (s->ce_src_tp_addr[i]) {
+            uint32_t hp_le = 0;
+            if (pci_dma_read(pci_dev, s->ce_src_tp_addr[i], &hp_le, 4) == MEMTX_OK)
+                s->ce_src_hp[i] = le32_to_cpu(hp_le) * 4;
+        }
+        if (s->ce_src_hp[i] != s->ce_src_tp[i]) {
             wcn7850_process_ce_src(s, pci_dev, i);
         }
     }
@@ -2855,6 +3406,8 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
     s->qmi_newserver_sent = false;
     s->qmi_newserver_resent = false;
     s->qmi_newserver_delivered = false;
+
+    s->htc_ready_sent = false;
 
     s->qmi_pending_ind = 0;
     s->qmi_client_node = QRTR_NODE_HOST;

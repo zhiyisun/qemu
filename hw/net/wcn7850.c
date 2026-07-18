@@ -2358,7 +2358,10 @@ static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
                                       const uint8_t *payload, uint32_t len)
 {
     /* Wire layout: WmiCmdHdr(4) + struct wmi_start_scan_cmd
-     *   { tlv_header(4), scan_id(4), scan_req_id(4), vdev_id(4), ... } */
+     *   { tlv_header(4), scan_id(4), scan_req_id(4), vdev_id(4), ... }
+     * The fixed struct is 160 bytes; num_chan lives at struct offset 68 and
+     * is followed by a WMI_TAG_ARRAY_UINT32 TLV (4-byte hdr) carrying the
+     * scanned channel frequencies (one __le32 each). */
     if (len < 16)
         return;
     const uint8_t *body = payload + sizeof(WmiCmdHdr);
@@ -2367,20 +2370,44 @@ static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
     qemu_log("WCN: WMI SCAN START scan_id=0x%x vdev=%u\n", s->scan_id,
              s->scan_vdev_id);
 
+    /* Determine whether the simulated AP's channel is part of this scan.
+     * mac80211 discards beacons reported on a channel it is not scanning,
+     * so we must only emit the beacon when ap_freq is in the channel list. */
+    bool ap_in_scan = false;
+    const uint32_t SCAN_FIXED_LEN = 160; /* sizeof(struct wmi_start_scan_cmd) */
+    const uint32_t NUM_CHAN_OFF = 68;    /* offset of num_chan within struct */
+    if (len >= sizeof(WmiCmdHdr) + SCAN_FIXED_LEN + 4) {
+        uint32_t num_chan =
+            le32_to_cpu(*(const uint32_t *)(body + NUM_CHAN_OFF));
+        /* chan_list follows the fixed struct + ARRAY_UINT32 TLV header */
+        const uint8_t *chan_list = body + SCAN_FIXED_LEN + 4;
+        uint32_t avail = len - (sizeof(WmiCmdHdr) + SCAN_FIXED_LEN + 4);
+        if (num_chan > avail / 4)
+            num_chan = avail / 4;
+        for (uint32_t i = 0; i < num_chan; i++) {
+            uint32_t f = le32_to_cpu(*(const uint32_t *)(chan_list + i * 4));
+            if (f == s->ap_freq) {
+                ap_in_scan = true;
+            }
+        }
+    }
+
     /* Scan flow the driver expects:
      *   STARTED -> (per channel) FOREIGN_CHAN + beacon (MGMT_RX) + BSS_CHANNEL
      *   -> COMPLETED */
     wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_STARTED, 0, 0);
-    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_FOREIGN_CHAN, 0,
-                            s->ap_freq);
-    /* Deliver the simulated AP beacon so mac80211 records the BSS. */
-    wcn7850_send_beacon(s, pci_dev);
-    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_BSS_CHANNEL, 0,
-                            s->ap_freq);
+    if (ap_in_scan) {
+        wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_FOREIGN_CHAN, 0,
+                                s->ap_freq);
+        /* Deliver the simulated AP beacon so mac80211 records the BSS. */
+        wcn7850_send_beacon(s, pci_dev);
+        wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_BSS_CHANNEL, 0,
+                                s->ap_freq);
+    }
     wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_COMPLETED,
                             WMI_SCAN_REASON_COMPLETED, 0);
-    fprintf(stderr, "WCN: scan sequence emitted for SSID '%.*s'\n",
-            s->ap_ssid_len, s->ap_ssid);
+    fprintf(stderr, "WCN: scan sequence emitted for SSID '%.*s' (ap_in_scan=%d)\n",
+            s->ap_ssid_len, s->ap_ssid, ap_in_scan);
 }
 
 static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
@@ -2520,6 +2547,7 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
     uint32_t ring_sz = s->ce_src_size[ce_pipe] ?: (WCN7850_CE_SRC_RING_SIZE * esize);
     uint32_t tp = s->ce_src_tp[ce_pipe];
     uint32_t hp = s->ce_src_hp[ce_pipe];
+    bool consumed = false;
 
     if (!base || !ring_sz)
         return;
@@ -2579,6 +2607,7 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
 
         tp += esize;
         if (tp >= ring_sz) tp = 0;
+        consumed = true;
     }
 
     s->ce_src_tp[ce_pipe] = tp;
@@ -2588,6 +2617,15 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
         uint32_t tp_le = cpu_to_le32(tp / 4);
         pci_dma_write(pci_dev, s->ce_src_tp_addr[ce_pipe],
                       &tp_le, sizeof(tp_le));
+    }
+
+    /* Fire the CE completion MSI so the driver's send_done_cb reaps the
+     * source ring and refreshes its cached_tp; otherwise ath12k_ce_send()
+     * sees num_free==0 (stale cached_tp) and fails later commands with
+     * -ENOBUFS once write_index wraps the ring. */
+    if (consumed) {
+        int msivec = wcn7850_ce_msi_vector(ce_pipe);
+        msi_notify(pci_dev, msivec);
     }
 }
 
@@ -4210,8 +4248,11 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
     s->ap_bssid[3] = 0x9a; s->ap_bssid[4] = 0x00; s->ap_bssid[5] = 0x01;
     memcpy(s->ap_ssid, "wcn7850-ap", 10);
     s->ap_ssid_len = 10;
-    s->ap_channel = 36;
-    s->ap_freq = 5180;
+    /* Channel 40 (5200 MHz): the driver's advertised 5GHz scan list starts
+     * at 5200 (channel 36/5180 is not scanned), so the AP must live on a
+     * channel that mac80211 actually visits for the beacon to register a BSS. */
+    s->ap_channel = 40;
+    s->ap_freq = 5200;
     s->peer_id = 1;
     s->peer_mapped = false;
     s->data_offload_enabled = true;

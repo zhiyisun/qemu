@@ -139,11 +139,16 @@
 #define WCN7850_REO_EXC_RING_HP    0x00003088
 #define WCN7850_REO_EXC_RING_TP    0x0000308c
 
-/* WBM release ring HP */
-#define WCN7850_WBM0_REL_RING_HP   0x000030c8
-
-/* RXDMA refill ring config base (SW2RXDMA) */
-#define WCN7850_RXDMA_BUF_BASE_LSB 0x00000e08
+/* WBM2SW release ring R0 registers (per-ring, stride 0x78) */
+#define WCN7850_WBM_RING_BASE_LSB(_n)   (0x00000e08 + (_n) * WCN7850_SRNG_STRIDE)
+#define WCN7850_WBM_RING_BASE_MSB(_n)   (0x00000e0c + (_n) * WCN7850_SRNG_STRIDE)
+#define WCN7850_WBM_RING_ID(_n)         (0x00000e10 + (_n) * WCN7850_SRNG_STRIDE)
+#define WCN7850_WBM_RING_MISC(_n)       (0x00000e18 + (_n) * WCN7850_SRNG_STRIDE)
+#define WCN7850_WBM_RING_HP_ADDR_LSB(_n) (0x00000e1c + (_n) * WCN7850_SRNG_STRIDE)
+#define WCN7850_WBM_RING_MSI1_DATA(_n)   (0x00000e58 + (_n) * WCN7850_SRNG_STRIDE)
+/* WBM2SW R2 (pointer) registers — stride 8 (HP at base, TP at base+4) */
+#define WCN7850_WBM_RING_HP(_n)     (0x000030c8 + (_n) * 8)
+#define WCN7850_WBM_RING_TP(_n)     (0x000030c8 + (_n) * 8 + 4)
 
 /* ===== CE (Copy Engine) register offsets (windowed, window_select=55) ===== */
 #define WCN7850_CE_WINDOW_SEL      55
@@ -170,6 +175,7 @@
 #define WMI_GRP_MGMT       0x7
 
 #define WMI_TLV_CMD(grp_id) (((grp_id) << 12) | 0x1)
+#define WMI_EVT_GRP_START_ID(grp_id) (((grp_id) << 12) | 0x1)
 
 /* WMI command IDs */
 #define WMI_SERVICE_READY_EVENTID  0x1
@@ -177,6 +183,46 @@
 #define WMI_INIT_CMDID             0x1
 #define WMI_VDEV_CREATE_CMDID      WMI_TLV_CMD(WMI_GRP_VDEV)
 #define WMI_PEER_CREATE_CMDID      WMI_TLV_CMD(WMI_GRP_PEER)
+
+/* Additional WMI command/event IDs used by the STA connect path.
+ * (event groups use WMI_EVT_GRP_START_ID(grp) = ((grp)<<12)|0x1) */
+#define WMI_START_SCAN_CMDID       WMI_TLV_CMD(WMI_GRP_SCAN)        /* 0x1001 */
+#define WMI_SCAN_CHAN_LIST_CMDID   (WMI_TLV_CMD(WMI_GRP_SCAN) + 2)  /* 0x1003 */
+#define WMI_VDEV_START_REQUEST_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
+#define WMI_VDEV_UP_CMDID          (WMI_TLV_CMD(WMI_GRP_VDEV) + 4)  /* 0x5005 */
+#define WMI_PEER_ASSOC_CMDID       (WMI_TLV_CMD(WMI_GRP_PEER) + 4)  /* 0x6005 */
+#define WMI_VDEV_INSTALL_KEY_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 0xd) /* 0x500e */
+
+#define WMI_SCAN_EVENTID           WMI_EVT_GRP_START_ID(WMI_GRP_SCAN)    /* 0x1001 */
+#define WMI_MGMT_RX_EVENTID        WMI_EVT_GRP_START_ID(WMI_GRP_MGMT)    /* 0x7001 */
+#define WMI_MGMT_TX_SEND_CMDID     (WMI_TLV_CMD(WMI_GRP_MGMT) + 1)       /* 0x7002 */
+#define WMI_PEER_ASSOC_CONF_EVENTID (WMI_TLV_CMD(WMI_GRP_PEER) + 5)      /* 0x6006 */
+#define WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
+#define WMI_MGMT_TX_COMPLETION_EVENTID (WMI_TLV_CMD(WMI_GRP_MGMT) + 5)   /* 0x7006 */
+#define WMI_VDEV_START_RESP_EVENTID WMI_TLV_CMD(WMI_GRP_VDEV)            /* 0x5001 */
+
+/* WMI scan event types (wmi_scan_event_type) */
+#define WMI_SCAN_EVENT_STARTED      BIT(0)
+#define WMI_SCAN_EVENT_COMPLETED    BIT(1)
+#define WMI_SCAN_EVENT_BSS_CHANNEL  BIT(2)
+#define WMI_SCAN_EVENT_FOREIGN_CHAN BIT(3)
+#define WMI_SCAN_REASON_COMPLETED   0x1
+
+/* WMI TLV tags used by the connect path */
+#define WMI_TAG_START_SCAN_CMD      1301
+#define WMI_TAG_SCAN_EVENT          36
+#define WMI_TAG_MGMT_RX_HDR         44
+#define WMI_TAG_ARRAY_BYTE          17
+#define WMI_TAG_PEER_ASSOC_CONF_EVENT 1658
+#define WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 1261
+#define WMI_TAG_MGMT_TX_SEND_CMD    1265
+#define WMI_TAG_MGMT_TX_COMPL_EVENT 1266
+
+/* HTT T2H message types (subset the model emits) */
+#define HTT_T2H_MSG_TYPE_PEER_MAP   0x0  /* PEER_MAP v1 */
+#define HTT_T2H_MSG_TYPE_PEER_MAP2  0x1a
+#define HTT_T2H_MSG_TYPE_PEER_MAP3  0x1f
+#define HTT_T2H_MSG_TYPE_VERSION_CONF 0x0  /* version req/conf share msg_type 0 */
 
 /* WMI TLV tags (matching driver enum) */
 #define WMI_TAG_ARRAY_UINT32              16
@@ -404,6 +450,17 @@ typedef struct {
 #define WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS   530
 #define WMI_TAG_HAL_REG_CAPABILITIES_EXT   531
 #define WMI_TAG_SOC_HAL_REG_CAPABILITIES   532
+
+/* WMI_SERVICE_AVAILABLE_EVENT: tells the driver about TLV services
+ * (bits 128-255). Without this, ath12k_mac_setup_vdev_params_mbssid
+ * believes the firmware lacks WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT
+ * (bit 253), enters the legacy code-path for a scan-link (link_id >= 15) and
+ * returns -ENOLINK because ath12k_mac_get_link_bss_conf returns NULL. */
+#define WMI_SERVICE_AVAILABLE_EVENTID       0x3
+#define WMI_TAG_SERVICE_AVAILABLE_EVENT     559
+#define WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT  253
+#define WMI_SERVICE_SEGMENT_BM_SIZE32       4
+#define WMI_MAX_SERVICE                     128
 
 /* Regulatory channel-list event (sent during init so the driver populates
  * ab->default_regd instead of falling back to the world domain). */
@@ -634,6 +691,27 @@ typedef struct WCN7850State {
     /* WMI state */
     bool wmi_service_ready_sent;
     bool wmi_ready_sent;
+
+    /* ===== Simulated AP + station connect state ===== */
+    /* Simulated AP BSS (open network by default). */
+    uint8_t ap_bssid[6];
+    uint8_t ap_ssid[33];
+    uint8_t ap_ssid_len;
+    uint32_t ap_channel;      /* 802.11 channel number */
+    uint32_t ap_freq;         /* MHz */
+
+    /* VDEV / peer assigned by the driver during connect. */
+    uint32_t vdev_id;
+    uint8_t peer_mac[6];      /* the AP peer MAC (== ap_bssid) */
+    uint16_t peer_id;         /* firmware-assigned peer id */
+    bool peer_mapped;         /* HTT PEER_MAP v1 emitted */
+
+    /* scan request details (so we can emit the matching scan events) */
+    uint32_t scan_id;
+    uint32_t scan_vdev_id;
+
+    /* data-path offload: synthetic RX frame generation toggle */
+    bool data_offload_enabled;
 } WCN7850State;
 
 #define TYPE_WCN7850 "wcn7850"
@@ -647,6 +725,16 @@ static bool wcn7850_mission_mode_setup(WCN7850State *s, PCIDevice *pci_dev);
 static void wcn7850_try_process_rx(WCN7850State *s, PCIDevice *pci_dev);
 static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
                                       WCN7850RingState *tcl);
+static void wcn7850_handle_peer_create(WCN7850State *s, PCIDevice *pci_dev,
+                                       const uint8_t *payload, uint32_t len);
+static void wcn7850_handle_peer_assoc(WCN7850State *s, PCIDevice *pci_dev,
+                                      const uint8_t *payload, uint32_t len);
+static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
+                                      const uint8_t *payload, uint32_t len);
+static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
+                                   const uint8_t *payload, uint32_t len);
+static void wcn7850_handle_install_key(WCN7850State *s, PCIDevice *pci_dev,
+                                       const uint8_t *payload, uint32_t len);
 
 /* Read a channel context from host DMA memory */
 static bool wcn7850_read_chan_ctxt(PCIDevice *pci_dev, uint64_t ctxt_addr,
@@ -990,6 +1078,37 @@ static void wcn7850_update_reo_ring_cfg(WCN7850State *s, int n)
     }
 }
 
+static void wcn7850_update_wbm_release_ring_cfg(WCN7850State *s, int n)
+{
+    uint32_t base_lsb, base_msb, ring_id_reg, misc;
+    WCN7850RingState *r = wcn7850_add_or_update_ring(s, WCN7850_RING_WBM2SW_RELEASE, n);
+    if (!r) return;
+
+    base_lsb = *(uint32_t *)(s->bar0_always_on + WCN7850_WBM_RING_BASE_LSB(n));
+    base_msb = *(uint32_t *)(s->bar0_always_on + WCN7850_WBM_RING_BASE_MSB(n));
+    ring_id_reg = *(uint32_t *)(s->bar0_always_on + WCN7850_WBM_RING_ID(n));
+    misc = *(uint32_t *)(s->bar0_always_on + WCN7850_WBM_RING_MISC(n));
+
+    r->base_addr = ((uint64_t)(base_msb & 0xff) << 32) | base_lsb;
+    r->size = (base_msb >> 8) & 0xffff;
+    r->entry_size = (ring_id_reg & 0xff) * 4;
+    r->hp_mmio_offset = WCN7850_WBM_RING_HP(n);
+    r->tp_mmio_offset = WCN7850_WBM_RING_TP(n);
+    r->hp_is_mmio = true;
+    r->tp_is_mmio = true;
+    r->enable = (misc & BIT(0)) != 0;
+    r->configured = (r->base_addr != 0 && r->entry_size > 0 && r->size > 0);
+
+    if (r->configured) {
+        uint32_t msi_data = *(uint32_t *)(s->bar0_always_on + WCN7850_WBM_RING_MSI1_DATA(n));
+        r->msivec = msi_data & 0xff;
+        if (r->msivec >= WCN7850_MSI_VECTORS)
+            r->msivec = 9;
+        fprintf(stderr, "WCN: WBM2SW ring %d base=0x%lx size=%u entry=%u enable=%d msivec=%u\n",
+                n, (unsigned long)r->base_addr, r->size, r->entry_size, r->enable, r->msivec);
+    }
+}
+
 /* ===== Buffer pool management ===== */
 
 static uint64_t wcn7850_pool_alloc_buf(WCN7850State *s)
@@ -1185,15 +1304,18 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
         uint8_t desc[32];
         uint64_t buf_addr;
         uint32_t buf_len;
+        uint32_t tcl_info1;
 
         if (pci_dma_read(pci_dev, desc_addr, desc, sizeof(desc)) != MEMTX_OK) {
             break;
         }
 
         buf_addr = le64_to_cpu(*(uint64_t *)desc);
-        buf_len = le32_to_cpu(*(uint32_t *)(desc + 8)) & 0xffff;
+        buf_len = le32_to_cpu(*(uint32_t *)(desc + 16)) & 0xffff;
+        tcl_info1 = le32_to_cpu(*(uint32_t *)(desc + 4));
 
         if (!buf_addr || !buf_len) {
+            /* Empty descriptor (driver has retired it); skip. */
             tp += entry_size;
             if (tp >= ring_size) tp = 0;
             continue;
@@ -1218,6 +1340,51 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
             NetClientState *nc = qemu_get_queue(s->nic);
             if (nc->peer) {
                 qemu_send_packet(nc->peer, s->tx_buffer, buf_len);
+            }
+        }
+
+        /* Post TX completion to the WBM2SW release ring */
+        {
+            static const int tcl_to_wbm[] = { 0, 2, 4 };
+            int wbm_idx = (tcl->ring_id < 3) ? tcl_to_wbm[tcl->ring_id] : 0;
+            WCN7850RingState *wbm = wcn7850_find_ring(s,
+                WCN7850_RING_WBM2SW_RELEASE, wbm_idx);
+            if (wbm && wbm->configured && wbm->enable && wbm->entry_size >= 32) {
+                uint32_t wbm_hp = wbm->hp;
+                uint32_t wbm_tp = wbm->tp;
+                uint32_t wbm_sz = wbm->size ?: (512 * wbm->entry_size);
+                uint32_t next_hp = wbm_hp + wbm->entry_size;
+                if (next_hp >= wbm_sz) next_hp = 0;
+
+                if (next_hp != wbm_tp) {
+                    uint8_t comp[32] = {0};
+                    uint32_t *comp32 = (uint32_t *)comp;
+                    /* buf_addr_info.info0 = 0 (not used for SW cookie path) */
+                    comp32[0] = 0;
+                    /* buf_addr_info.info1 = captured TCL info1 (SW cookie in bits 31:12) */
+                    comp32[1] = cpu_to_le32(tcl_info1);
+                    /* info0: REL_SRC_MODULE=TQM(0), DESC_TYPE=REL_MSDU(0),
+                     * TQM_RELEASE_REASON=FRAME_ACKED(0), CC_DONE=0 (SW path) */
+                    comp32[2] = 0;
+                    /* info1: TRANSMIT_COUNT = 1 */
+                    comp32[3] = cpu_to_le32(1u << 24);
+                    /* info2: FIRST_MSDU | LAST_MSDU */
+                    comp32[4] = cpu_to_le32((1u << 8) | (1u << 9));
+                    /* info3..5 = 0 (maps to rate_stats.info0, tsf, info3 in
+                     * hal_wbm_completion_ring_tx) */
+                    comp32[5] = 0;
+                    comp32[6] = 0;
+                    comp32[7] = 0;
+
+                    if (pci_dma_write(pci_dev, wbm->base_addr + wbm_hp,
+                                      comp, sizeof(comp)) == MEMTX_OK) {
+                        wbm->hp = next_hp;
+                        *(uint32_t *)(s->bar0_always_on + wbm->hp_mmio_offset) = next_hp;
+                        if (wbm->msivec < WCN7850_MSI_VECTORS) {
+                            msi_notify(pci_dev, wbm->msivec);
+                        }
+                    }
+                }
             }
         }
 
@@ -1513,11 +1680,56 @@ static void wcn7850_send_wmi_reg_chan_list_cc(WCN7850State *s, PCIDevice *pci_de
     h->hdr_info = cpu_to_le32(HTC_EP_WMI | (total_len << 16));
     h->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*h), buf, total_len);
-    wcn7850_wmi_send_event(s, pci_dev, 1, htc_buf, sizeof(*h) + total_len);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total_len);
 }
 
 /* Build and send a WMI_SERVICE_READY_EVENT to the driver */
 static void wcn7850_send_wmi_service_ready_ext(WCN7850State *s, PCIDevice *pci_dev);
+
+/* Send WMI_SERVICE_AVAILABLE_EVENT (0x3) so the driver populates
+ * svc_map for TLV services 128-255 (including
+ * WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT = 253).
+ * Without this, scan links get -ENOLINK. */
+static void wcn7850_send_wmi_service_available(WCN7850State *s, PCIDevice *pci_dev)
+{
+    uint8_t buf[128];
+    uint32_t off = 0;
+
+    struct QEMU_PACKED wmi_service_available_event {
+        uint32_t wmi_service_segment_offset;
+        uint32_t wmi_service_segment_bitmap[WMI_SERVICE_SEGMENT_BM_SIZE32];
+    };
+
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    hdr->cmd_id = cpu_to_le32(WMI_SERVICE_AVAILABLE_EVENTID);
+    off += sizeof(*hdr);
+
+    WmiTlv *tlv = (WmiTlv *)(buf + off);
+    tlv->header = WMI_TLV_HDR(WMI_TAG_SERVICE_AVAILABLE_EVENT,
+                              sizeof(struct wmi_service_available_event));
+    off += sizeof(*tlv);
+
+    struct wmi_service_available_event *ev = (struct wmi_service_available_event *)(buf + off);
+    memset(ev, 0, sizeof(*ev));
+    ev->wmi_service_segment_offset = cpu_to_le32(WMI_MAX_SERVICE);
+    /* Set bit for service 253 (WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT).
+     * Service 253 maps to segment bitmap index 3, bit 29
+     * (offset = 253 - WMI_MAX_SERVICE = 125, word = 125/32 = 3, bit = 125%32 = 29). */
+    ev->wmi_service_segment_bitmap[3] = cpu_to_le32(BIT(29));
+    off += sizeof(*ev);
+
+    uint32_t total_len = off;
+
+    uint8_t htc_buf[256];
+    HtcHdr *hdr2 = (HtcHdr *)htc_buf;
+    hdr2->hdr_info = cpu_to_le32(HTC_EP_WMI | (total_len << 16));
+    hdr2->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*hdr2), buf, total_len);
+
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*hdr2) + total_len);
+    fprintf(stderr, "WCN: sent WMI_SERVICE_AVAILABLE (0x3) for bit 253 cons=%u\n",
+            s->ce_dst_cons[2]);
+}
 
 static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
 {
@@ -1573,11 +1785,12 @@ static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
     hdr2->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*hdr2), buf, total_len);
 
-    wcn7850_wmi_send_event(s, pci_dev, 1, /* HTC ctrl DL: ordered after connect resp so WMI ep rx_cb is registered */
+    wcn7850_wmi_send_event(s, pci_dev, 2, /* WMI DL pipe */
                             htc_buf, sizeof(*hdr2) + total_len);
 
     wcn7850_send_wmi_service_ready_ext(s, pci_dev);
     wcn7850_send_wmi_reg_chan_list_cc(s, pci_dev);
+    wcn7850_send_wmi_service_available(s, pci_dev);
     s->wmi_service_ready_sent = true;
 }
 
@@ -1696,7 +1909,7 @@ static void wcn7850_send_wmi_service_ready_ext(WCN7850State *s, PCIDevice *pci_d
     h2->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*h2), buf, total_len);
 
-    wcn7850_wmi_send_event(s, pci_dev, 1, htc_buf, sizeof(*h2) + total_len);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h2) + total_len);
 }
 
 /* Build and send a WMI_READY_EVENT to the driver */
@@ -1721,7 +1934,11 @@ static void wcn7850_send_wmi_ready(WCN7850State *s, PCIDevice *pci_dev)
 
     memset(buf + off, 0, re_len);
     /* fw_abi_vers at offset 0..23 (6×uint32_t), keep zero */
-    /* mac_addr at offset 24..31 (ETH_ALEN + 2 padding), keep zero */
+    /* mac_addr at offset 24..31 (ETH_ALEN + 2 padding): set device MAC */
+    {
+        const uint8_t dev_mac[6] = { 0x00, 0x14, 0x6c, 0x9a, 0x00, 0x02 };
+        memcpy(buf + off + 24, dev_mac, 6);
+    }
     *(uint32_t *)(buf + off + 32) = cpu_to_le32(0);  /* status = 0 (success) */
     *(uint32_t *)(buf + off + 36) = cpu_to_le32(0);  /* num_dscp_table */
     *(uint32_t *)(buf + off + 40) = cpu_to_le32(0);  /* num_extra_mac_addr */
@@ -1737,9 +1954,12 @@ static void wcn7850_send_wmi_ready(WCN7850State *s, PCIDevice *pci_dev)
     h2->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*h2), buf, total_len);
 
-    wcn7850_wmi_send_event(s, pci_dev, 1, /* HTC ctrl DL: ordered after connect resp so WMI ep rx_cb is registered */
+    fprintf(stderr, "WCN: calling wcn7850_wmi_send_event for WMI ready len=%u cons=%u\n",
+            sizeof(*h2) + total_len, s->ce_dst_cons[2]);
+    wcn7850_wmi_send_event(s, pci_dev, 2, /* WMI DL pipe */
                             htc_buf, sizeof(*h2) + total_len);
     s->wmi_ready_sent = true;
+    fprintf(stderr, "WCN: wmi_ready_sent=true, cons now=%u\n", s->ce_dst_cons[2]);
 }
 
 /* Initialize HTC EP0 after getting HTC_SETUP_COMPLETE */
@@ -1831,10 +2051,386 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
         qemu_log("WCN: WMI INIT cmd\n");
         wcn7850_send_wmi_ready(s, pci_dev);
         break;
+    case WMI_VDEV_CREATE_CMDID:
+        qemu_log("WCN: WMI VDEV CREATE cmd\n");
+        /* Fire-and-forget: no response expected by the driver. */
+        break;
+    case WMI_VDEV_UP_CMDID:
+        qemu_log("WCN: WMI VDEV UP cmd\n");
+        /* Fire-and-forget. */
+        break;
+    case WMI_PEER_CREATE_CMDID:
+        wcn7850_handle_peer_create(s, pci_dev, payload, len);
+        break;
+    case WMI_PEER_ASSOC_CMDID:
+        wcn7850_handle_peer_assoc(s, pci_dev, payload, len);
+        break;
+    case WMI_START_SCAN_CMDID:
+        wcn7850_handle_scan_start(s, pci_dev, payload, len);
+        break;
+    case WMI_SCAN_CHAN_LIST_CMDID:
+        qemu_log("WCN: WMI SCAN CHAN LIST cmd (ignored)\n");
+        break;
+    case WMI_MGMT_TX_SEND_CMDID:
+        wcn7850_handle_mgmt_tx(s, pci_dev, payload, len);
+        break;
+    case WMI_VDEV_INSTALL_KEY_CMDID:
+        wcn7850_handle_install_key(s, pci_dev, payload, len);
+        break;
     default:
         qemu_log("WCN: WMI cmd 0x%x len=%u (unhandled)\n", cmd_id, len);
         break;
     }
+}
+
+/* Emit an HTT T2H PEER_MAP v1 message on the HTT/WMI DL CE pipe (pipe 1,
+ * EPID 1) so the driver's ath12k_wait_for_peer_created() completes.
+ * WCN7850 uses peer_map_unmap_version = 0x1 (PEER_MAP v1). */
+static void wcn7850_send_htt_peer_map(WCN7850State *s, PCIDevice *pci_dev,
+                                      uint32_t vdev_id, uint16_t peer_id,
+                                      const uint8_t *mac)
+{
+    uint8_t buf[32];
+    HtcHdr *h = (HtcHdr *)buf;
+    /* HTT T2H PEER_MAP v1 fixed layout (host byte order fields):
+     *   msg_type (1B) | vdev_id (1B) | peer_id (2B) | mac (6B) | ast_hash (4B) */
+    uint8_t *p = buf + sizeof(*h);
+    p[0] = HTT_T2H_MSG_TYPE_PEER_MAP;          /* msg_type */
+    p[1] = (uint8_t)vdev_id;                    /* vdev_id */
+    p[2] = peer_id & 0xff;                       /* peer_id low */
+    p[3] = (peer_id >> 8) & 0xff;                /* peer_id high */
+    memcpy(p + 4, mac, 6);                       /* peer MAC */
+    /* ast_hash / next_hop (4 bytes) — set to peer_id for simplicity */
+    p[10] = peer_id & 0xff; p[11] = (peer_id >> 8) & 0xff;
+    p[12] = 0; p[13] = 0;
+    uint32_t total = sizeof(*h) + 14;
+
+    h->hdr_info = cpu_to_le32((total - sizeof(*h)) << 16 | 1); /* EPID 1 */
+    h->ctrl_info = 0;
+    wcn7850_wmi_send_event(s, pci_dev, 1, buf, total);
+    fprintf(stderr, "WCN: HTT PEER_MAP v1 vdev=%u peer_id=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            vdev_id, peer_id, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/* Build and send a WMI_PEER_ASSOC_CONF_EVENT so ath12k_bss_assoc()'s
+ * wait_for_completion_timeout(&ar->peer_assoc_done) fires. */
+static void wcn7850_send_peer_assoc_conf(WCN7850State *s, PCIDevice *pci_dev,
+                                         uint32_t vdev_id, const uint8_t *mac)
+{
+    uint8_t buf[128];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t off = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_PEER_ASSOC_CONF_EVENTID);
+    off += sizeof(*hdr);
+
+    uint32_t tlv_start = off;
+    WmiTlv *tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*tlv);
+    struct {
+        uint32_t vdev_id;
+        uint8_t mac[6];
+        uint8_t rsvd[2];
+    } QEMU_PACKED conf;
+    conf.vdev_id = cpu_to_le32(vdev_id);
+    memcpy(conf.mac, mac, 6);
+    conf.rsvd[0] = conf.rsvd[1] = 0;
+    memcpy(buf + off, &conf, sizeof(conf));
+    off += sizeof(conf);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_PEER_ASSOC_CONF_EVENT,
+                                          off - (tlv_start + sizeof(*tlv))));
+
+    uint32_t total = off;
+    uint8_t htc_buf[256];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+    fprintf(stderr, "WCN: PEER ASSOC CONF vdev=%u\n", vdev_id);
+}
+
+/* Build and send a WMI_VDEV_INSTALL_KEY_COMPLETE_EVENT. */
+static void wcn7850_send_install_key_compl(WCN7850State *s, PCIDevice *pci_dev,
+                                           uint32_t vdev_id)
+{
+    uint8_t buf[128];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t off = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID);
+    off += sizeof(*hdr);
+
+    uint32_t tlv_start = off;
+    WmiTlv *tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*tlv);
+    struct {
+        uint32_t vdev_id;
+        uint32_t key_idx;
+        uint32_t status;
+    } QEMU_PACKED kc;
+    kc.vdev_id = cpu_to_le32(vdev_id);
+    kc.key_idx = 0;
+    kc.status = 0;
+    memcpy(buf + off, &kc, sizeof(kc));
+    off += sizeof(kc);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT,
+                                          off - (tlv_start + sizeof(*tlv))));
+
+    uint32_t total = off;
+    uint8_t htc_buf[256];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+    fprintf(stderr, "WCN: INSTALL KEY COMPLETE vdev=%u\n", vdev_id);
+}
+
+/* Emit a WMI_SCAN_EVENT with the given event_type/reason. */
+static void wcn7850_send_scan_event(WCN7850State *s, PCIDevice *pci_dev,
+                                    uint32_t event_type, uint32_t reason,
+                                    uint32_t freq)
+{
+    uint8_t buf[128];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t off = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_SCAN_EVENTID);
+    off += sizeof(*hdr);
+
+    uint32_t tlv_start = off;
+    WmiTlv *tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*tlv);
+    struct {
+        uint32_t event_type;
+        uint32_t reason;
+        uint32_t channel_freq;
+        uint32_t scan_req_id;
+        uint32_t scan_id;
+        uint32_t vdev_id;
+        uint32_t tsf;
+    } QEMU_PACKED se;
+    se.event_type = cpu_to_le32(event_type);
+    se.reason = cpu_to_le32(reason);
+    se.channel_freq = cpu_to_le32(freq);
+    se.scan_req_id = 0;
+    se.scan_id = cpu_to_le32(s->scan_id);
+    se.vdev_id = cpu_to_le32(s->scan_vdev_id);
+    se.tsf = 0;
+    memcpy(buf + off, &se, sizeof(se));
+    off += sizeof(se);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_SCAN_EVENT,
+                                          off - (tlv_start + sizeof(*tlv))));
+
+    uint32_t total = off;
+    uint8_t htc_buf[256];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+}
+
+/* Synthesize a minimal but valid 802.11 Beacon frame for the simulated AP
+ * and deliver it via WMI_MGMT_RX_EVENTID so mac80211 builds the BSS. */
+static void wcn7850_send_beacon(WCN7850State *s, PCIDevice *pci_dev)
+{
+    /* 802.11 Beacon: MAC header (24B) + timestamp(8) + interval(2) +
+     * capability(2) + SSID IE + supported rates IE + DS IE + (optional RSN). */
+    uint8_t frame[256];
+    uint32_t off = 0;
+    /* MAC header: FC=Beacon(0x80), dur=0, DA=bcast, SA=BSSID, BSSID, seq=0 */
+    frame[off++] = 0x80; frame[off++] = 0x00;
+    frame[off++] = 0x00; frame[off++] = 0x00;
+    memset(frame + off, 0xff, 6); off += 6;            /* DA = broadcast */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* SA = BSSID */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* BSSID */
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* seq */
+    /* beacon interval = 100 TU */
+    frame[off++] = 0x64; frame[off++] = 0x00;
+    /* capability: ESS(0x0001), short preamble */
+    frame[off++] = 0x01; frame[off++] = 0x00;
+    /* SSID IE (id 0, len, ssid) */
+    frame[off++] = 0x00; frame[off++] = s->ap_ssid_len;
+    memcpy(frame + off, s->ap_ssid, s->ap_ssid_len); off += s->ap_ssid_len;
+    /* Supported rates IE (id 1): 6,9,12,18,24,36,48,54 Mbps */
+    frame[off++] = 0x01; frame[off++] = 8;
+    static const uint8_t rates[8] = {0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
+    memcpy(frame + off, rates, 8); off += 8;
+    /* DS parameter set IE (id 3): channel */
+    frame[off++] = 0x03; frame[off++] = 1;
+    frame[off++] = (uint8_t)s->ap_channel;
+    uint32_t frame_len = off;
+
+    /* Wrap in WMI_MGMT_RX_EVENTID: MGMT_RX_HDR TLV + ARRAY_BYTE (frame). */
+    uint8_t buf[512];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t b = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_MGMT_RX_EVENTID);
+    b += sizeof(*hdr);
+
+    /* MGMT_RX_HDR TLV */
+    uint32_t hdr_start = b;
+    WmiTlv *tlv = (WmiTlv *)(buf + b);
+    b += sizeof(*tlv);
+    /* Must match struct ath12k_wmi_mgmt_rx_params (68 bytes, ATH_MAX_ANTENNA=4):
+     * channel, snr, rate, phy_mode, buf_len, status, rssi_ctl[4], flags,
+     * rssi, tsf_delta, rx_tsf_l32, rx_tsf_u32, pdev_id, chan_freq. */
+    struct {
+        uint32_t channel;
+        uint32_t snr;
+        uint32_t rate;
+        uint32_t phy_mode;
+        uint32_t buf_len;
+        uint32_t status;
+        uint32_t rssi_ctl[4];
+        uint32_t flags;
+        int32_t  rssi;
+        uint32_t tsf_delta;
+        uint32_t rx_tsf_l32;
+        uint32_t rx_tsf_u32;
+        uint32_t pdev_id;
+        uint32_t chan_freq;
+    } QEMU_PACKED mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.channel = cpu_to_le32(s->ap_channel);
+    mh.snr = cpu_to_le32(40);
+    mh.rate = cpu_to_le32(120); /* 12 Mbps */
+    mh.phy_mode = cpu_to_le32(0xb); /* 11A */
+    mh.buf_len = cpu_to_le32(frame_len);
+    mh.status = 0;
+    mh.rssi = cpu_to_le32((uint32_t)(-50));
+    mh.pdev_id = 0;
+    mh.chan_freq = cpu_to_le32(s->ap_freq);
+    memcpy(buf + b, &mh, sizeof(mh));
+    b += sizeof(mh);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_MGMT_RX_HDR,
+                                          b - (hdr_start + sizeof(*tlv))));
+
+    /* ARRAY_BYTE TLV carrying the raw frame */
+    uint32_t arr_start = b;
+    WmiTlv *tlv2 = (WmiTlv *)(buf + b);
+    b += sizeof(*tlv2);
+    memcpy(buf + b, frame, frame_len);
+    b += frame_len;
+    tlv2->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_ARRAY_BYTE,
+                                           b - (arr_start + sizeof(*tlv2))));
+
+    uint32_t total = b;
+    uint8_t htc_buf[768];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+    fprintf(stderr, "WCN: MGMT RX beacon sent (chan %u, %u bytes)\n",
+            s->ap_channel, frame_len);
+}
+
+/* WMI command handlers (connect path) */
+
+static void wcn7850_handle_peer_create(WCN7850State *s, PCIDevice *pci_dev,
+                                       const uint8_t *payload, uint32_t len)
+{
+    /* Wire layout: WmiCmdHdr(4) + struct wmi_peer_create_cmd
+     *   { tlv_header(4), vdev_id(4), peer_macaddr(8), peer_type(4) } */
+    if (len < 16)
+        return;
+    const uint8_t *body = payload + sizeof(WmiCmdHdr); /* start of struct */
+    uint32_t vdev_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+    /* peer_macaddr is at struct offset 8; we force it to the simulated AP. */
+    s->vdev_id = vdev_id;
+    memcpy(s->peer_mac, s->ap_bssid, 6);
+    qemu_log("WCN: WMI PEER CREATE vdev=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+             vdev_id, s->peer_mac[0], s->peer_mac[1], s->peer_mac[2],
+             s->peer_mac[3], s->peer_mac[4], s->peer_mac[5]);
+    /* The driver waits for an HTT T2H PEER_MAP v1 (peer_map_unmap_version=1). */
+    wcn7850_send_htt_peer_map(s, pci_dev, vdev_id, s->peer_id, s->ap_bssid);
+    s->peer_mapped = true;
+}
+
+static void wcn7850_handle_peer_assoc(WCN7850State *s, PCIDevice *pci_dev,
+                                      const uint8_t *payload, uint32_t len)
+{
+    qemu_log("WCN: WMI PEER ASSOC cmd len=%u\n", len);
+    wcn7850_send_peer_assoc_conf(s, pci_dev, s->vdev_id, s->ap_bssid);
+}
+
+static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
+                                      const uint8_t *payload, uint32_t len)
+{
+    /* Wire layout: WmiCmdHdr(4) + struct wmi_start_scan_cmd
+     *   { tlv_header(4), scan_id(4), scan_req_id(4), vdev_id(4), ... } */
+    if (len < 16)
+        return;
+    const uint8_t *body = payload + sizeof(WmiCmdHdr);
+    s->scan_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+    s->scan_vdev_id = le32_to_cpu(*(const uint32_t *)(body + 12));
+    qemu_log("WCN: WMI SCAN START scan_id=0x%x vdev=%u\n", s->scan_id,
+             s->scan_vdev_id);
+
+    /* Scan flow the driver expects:
+     *   STARTED -> (per channel) FOREIGN_CHAN + beacon (MGMT_RX) + BSS_CHANNEL
+     *   -> COMPLETED */
+    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_STARTED, 0, 0);
+    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_FOREIGN_CHAN, 0,
+                            s->ap_freq);
+    /* Deliver the simulated AP beacon so mac80211 records the BSS. */
+    wcn7850_send_beacon(s, pci_dev);
+    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_BSS_CHANNEL, 0,
+                            s->ap_freq);
+    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_COMPLETED,
+                            WMI_SCAN_REASON_COMPLETED, 0);
+    fprintf(stderr, "WCN: scan sequence emitted for SSID '%.*s'\n",
+            s->ap_ssid_len, s->ap_ssid);
+}
+
+static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
+                                   const uint8_t *payload, uint32_t len)
+{
+    /* Wire layout: WmiCmdHdr(4) + struct wmi_mgmt_send_cmd
+     *   { tlv_header(4), vdev_id(4), desc_id(4), chanfreq(4),
+     *     paddr_lo(4), paddr_hi(4), frame_len(4), ... } */
+    if (len < 28)
+        return;
+    const uint8_t *body = payload + sizeof(WmiCmdHdr);
+    uint32_t vdev_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+    uint32_t frame_len = le32_to_cpu(*(const uint32_t *)(body + 24));
+    qemu_log("WCN: WMI MGMT TX vdev=%u frame_len=%u\n", vdev_id, frame_len);
+
+    /* Emit MGMT_TX_COMPLETION_EVENT so the driver's tx completion fires. */
+    uint8_t buf[64];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t b = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_MGMT_TX_COMPLETION_EVENTID);
+    b += sizeof(*hdr);
+    uint32_t tlv_start = b;
+    WmiTlv *tlv = (WmiTlv *)(buf + b);
+    b += sizeof(*tlv);
+    struct {
+        uint32_t vdev_id;
+        uint32_t tx_status;
+        uint32_t cookie; /* echoes frame pointer cookie from the cmd */
+    } QEMU_PACKED mc;
+    mc.vdev_id = cpu_to_le32(vdev_id);
+    mc.tx_status = 0;
+    mc.cookie = 0;
+    memcpy(buf + b, &mc, sizeof(mc));
+    b += sizeof(mc);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_MGMT_TX_COMPL_EVENT,
+                                          b - (tlv_start + sizeof(*tlv))));
+    uint32_t total = b;
+    uint8_t htc_buf[128];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+}
+
+static void wcn7850_handle_install_key(WCN7850State *s, PCIDevice *pci_dev,
+                                       const uint8_t *payload, uint32_t len)
+{
+    qemu_log("WCN: WMI INSTALL KEY cmd len=%u\n", len);
+    wcn7850_send_install_key_compl(s, pci_dev, s->vdev_id);
 }
 
 /* Handle HTT command from driver (sent via HTC EP HTT on CE pipe 4).
@@ -2273,8 +2869,10 @@ static uint32_t wcn7850_qmi_build_phy_cap_resp(uint8_t *buf, uint32_t buf_size,
     uint8_t *tlv;
     uint32_t total;
 
-    /* TLVs: result(7) + num_phy(5) + board_id(8) + single_chip_mlo_support(5) */
-    uint32_t tlv_len = 7 + 5 + 8 + 5;
+    /* TLVs: result(7) + num_phy(4) + board_id(7) + single_chip_mlo_support(4)
+     * Optional fields carry NO validity prefix on the wire; the TLV's
+     * presence alone signals validity to the vanilla QMI decoder. */
+    uint32_t tlv_len = 7 + 4 + 7 + 4;
     total = sizeof(*hdr) + tlv_len;
     if (total > buf_size)
         return 0;
@@ -2289,20 +2887,17 @@ static uint32_t wcn7850_qmi_build_phy_cap_resp(uint8_t *buf, uint32_t buf_size,
     tlv[0] = 0x02; tlv[1] = 0x04; tlv[2] = 0x00;
     tlv[3] = 0x00; tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00;
     tlv += 7;
-    /* TLV type 0x10: num_phy, length 2 = valid(1) + value(1) */
-    tlv[0] = 0x10; tlv[1] = 0x02; tlv[2] = 0x00;
-    tlv[3] = 0x01; /* valid = true */
-    tlv[4] = 0x01; /* num_phy = 1 */
-    tlv += 5;
-    /* TLV type 0x11: board_id, length 5 = valid(1) + board_id(4) */
-    tlv[0] = 0x11; tlv[1] = 0x05; tlv[2] = 0x00;
-    tlv[3] = 0x01; /* valid = true */
-    tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00; tlv[7] = 0x00; /* board_id = 0 */
-    tlv += 8;
-    /* TLV type 0x13: single_chip_mlo_support, length 2 = valid(1) + value(1) */
-    tlv[0] = 0x13; tlv[1] = 0x02; tlv[2] = 0x00;
-    tlv[3] = 0x01; /* valid = true */
-    tlv[4] = 0x00; /* single_chip_mlo_support = false */
+    /* TLV type 0x10: num_phy, length 1 = value(1) */
+    tlv[0] = 0x10; tlv[1] = 0x01; tlv[2] = 0x00;
+    tlv[3] = 0x01; /* num_phy = 1 */
+    tlv += 4;
+    /* TLV type 0x11: board_id, length 4 = board_id(4) */
+    tlv[0] = 0x11; tlv[1] = 0x04; tlv[2] = 0x00;
+    tlv[3] = 0x00; tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00; /* board_id = 0 */
+    tlv += 7;
+    /* TLV type 0x13: single_chip_mlo_support, length 1 = value(1) */
+    tlv[0] = 0x13; tlv[1] = 0x01; tlv[2] = 0x00;
+    tlv[3] = 0x00; /* single_chip_mlo_support = false */
 
     return total;
 }
@@ -2313,18 +2908,19 @@ static uint32_t wcn7850_qmi_build_cap_resp(uint8_t *buf, uint32_t buf_size,
 {
     QmiHdr *hdr = (QmiHdr *)buf;
     uint8_t *tlv;
-    /* result + chip_info(8) + board_info(4) + fw_version_info(4+1+9) */
+    /* result + chip_info(8) + board_info(4) + fw_version_info(4+1+9)
+     * Optional fields carry NO validity prefix on the wire; the TLV's
+     * presence alone signals validity to the vanilla QMI decoder. */
     const char *fw_ts = "2025-01-01";
     uint8_t fw_ts_len = strlen(fw_ts);
     uint32_t tlv_val = 0;
     uint32_t tlv_len = 0;
 
     /* result TLV (type=0x02, val=4 bytes): 3 header + 4 = 7 */
-    /* chip_info TLV (type=0x10): opt_flag(1) + chip_id(4) + chip_family(4) = 9 */
-    /* board_info TLV (type=0x11): opt_flag(1) + board_id(4) = 5 */
-    /* fw_version_info TLV (type=0x13): opt_flag(1) + fw_version(4)
-     *   + string_len(1) + fw_ts_len */
-    tlv_len = 7 + (3 + 1 + 8) + (3 + 1 + 4) + (3 + 1 + 4 + 1 + fw_ts_len);
+    /* chip_info TLV (type=0x10): chip_id(4) + chip_family(4) = 8 */
+    /* board_info TLV (type=0x11): board_id(4) = 4 */
+    /* fw_version_info TLV (type=0x13): fw_version(4) + string_len(1) + fw_ts_len */
+    tlv_len = 7 + (3 + 8) + (3 + 4) + (3 + 4 + 1 + fw_ts_len);
     uint32_t total = sizeof(*hdr) + tlv_len;
 
     if (total > buf_size)
@@ -2340,29 +2936,26 @@ static uint32_t wcn7850_qmi_build_cap_resp(uint8_t *buf, uint32_t buf_size,
     tlv[0] = 0x02; tlv[1] = 0x04; tlv[2] = 0x00;
     tlv[3] = 0x00; tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00;
     tlv += 7;
-    /* TLV: chip_info (type 0x10, len 0x09): opt_flag(1) + chip_id(4) + chip_family(4) */
-    tlv[0] = 0x10; tlv[1] = (1 + 8) & 0xff; tlv[2] = 0x00;
-    tlv[3] = 0x01; /* chip_info_valid = true */
+    /* TLV: chip_info (type 0x10, len 0x08): chip_id(4) + chip_family(4) */
+    tlv[0] = 0x10; tlv[1] = 8; tlv[2] = 0x00;
     tlv_val = cpu_to_le32(2);
-    memcpy(&tlv[4], &tlv_val, 4); /* chip_id = 2 */
+    memcpy(&tlv[3], &tlv_val, 4); /* chip_id = 2 */
     tlv_val = cpu_to_le32(0);
-    memcpy(&tlv[8], &tlv_val, 4); /* chip_family = 0 */
-    tlv += 3 + 1 + 8;
-    /* TLV: board_info (type 0x11, len 0x05): opt_flag(1) + board_id(4) */
-    tlv[0] = 0x11; tlv[1] = (1 + 4) & 0xff; tlv[2] = 0x00;
-    tlv[3] = 0x01; /* board_info_valid = true */
+    memcpy(&tlv[7], &tlv_val, 4); /* chip_family = 0 */
+    tlv += 3 + 8;
+    /* TLV: board_info (type 0x11, len 0x04): board_id(4) */
+    tlv[0] = 0x11; tlv[1] = 4; tlv[2] = 0x00;
     tlv_val = cpu_to_le32(0);
-    memcpy(&tlv[4], &tlv_val, 4); /* board_id = 0 */
-    tlv += 3 + 1 + 4;
-    /* TLV: fw_version_info (type 0x13): opt_flag(1) + fw_version(4) + string */
+    memcpy(&tlv[3], &tlv_val, 4); /* board_id = 0 */
+    tlv += 3 + 4;
+    /* TLV: fw_version_info (type 0x13): fw_version(4) + string */
     tlv[0] = 0x13;
-    tlv[1] = (1 + 4 + 1 + fw_ts_len) & 0xff;
-    tlv[2] = ((1 + 4 + 1 + fw_ts_len) >> 8) & 0xff;
-    tlv[3] = 0x01; /* fw_version_info_valid = true */
+    tlv[1] = (4 + 1 + fw_ts_len) & 0xff;
+    tlv[2] = ((4 + 1 + fw_ts_len) >> 8) & 0xff;
     tlv_val = cpu_to_le32(1);
-    memcpy(&tlv[4], &tlv_val, 4); /* fw_version = 1 */
-    tlv[8] = fw_ts_len; /* string length prefix (1 byte) */
-    memcpy(&tlv[9], fw_ts, fw_ts_len); /* string content */
+    memcpy(&tlv[3], &tlv_val, 4); /* fw_version = 1 */
+    tlv[7] = fw_ts_len; /* string length prefix (1 byte) */
+    memcpy(&tlv[8], fw_ts, fw_ts_len); /* string content */
 
     return total;
 }
@@ -3290,6 +3883,19 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
         }
     }
 
+    /* WBM2SW release ring config registers (R0) */
+    for (int i = 0; i < WCN7850_NUM_WBM_RINGS; i++) {
+        if (addr == WCN7850_WBM_RING_BASE_LSB(i) ||
+            addr == WCN7850_WBM_RING_BASE_MSB(i) ||
+            addr == WCN7850_WBM_RING_ID(i) ||
+            addr == WCN7850_WBM_RING_MISC(i) ||
+            addr == WCN7850_WBM_RING_MSI1_DATA(i)) {
+            memcpy(s->bar0_always_on + addr, &val, size);
+            wcn7850_update_wbm_release_ring_cfg(s, i);
+            return;
+        }
+    }
+
     /* TCL HP write (SW producing TX descriptors → trigger TX processing) */
     for (int i = 0; i < WCN7850_NUM_TCL_RINGS; i++) {
         if (addr == WCN7850_TCL_RING_HP(i)) {
@@ -3337,7 +3943,21 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
         }
     }
 
-
+    /* WBM2SW release ring HP/TP (driver consuming TX completions) */
+    for (int i = 0; i < WCN7850_NUM_WBM_RINGS; i++) {
+        if (addr == WCN7850_WBM_RING_HP(i)) {
+            memcpy(s->bar0_always_on + addr, &val, size);
+            WCN7850RingState *r = wcn7850_find_ring(s, WCN7850_RING_WBM2SW_RELEASE, i);
+            if (r) r->hp = val;
+            return;
+        }
+        if (addr == WCN7850_WBM_RING_TP(i)) {
+            memcpy(s->bar0_always_on + addr, &val, size);
+            WCN7850RingState *r = wcn7850_find_ring(s, WCN7850_RING_WBM2SW_RELEASE, i);
+            if (r) r->tp = val;
+            return;
+        }
+    }
 
     if (addr < WCN7850_WINDOW_START) {
         memcpy(s->bar0_always_on + addr, &val, size);
@@ -3492,9 +4112,11 @@ static void wcn7850_ce_poll_timer(void *opaque)
     }
 
     if (s->wmi_service_ready_pending && !s->wmi_ready_sent) {
-        int wmi_dl = s->htc_ep[HTC_EP_WMI].dl_pipe ?: 2;
-        if (s->ce_dst_base[wmi_dl]) {
-            qemu_log("WCN: sending WMI service ready (dl pipe %d)\n", wmi_dl);
+        /* WMI events are always sent through HTC control DL (CE pipe 1),
+         * regardless of the WMI endpoint's configured dl_pipe.  Check that
+         * CE1 has a posted buffer before proceeding. */
+        if (s->ce_dst_base[1]) {
+            qemu_log("WCN: sending WMI service ready (dl pipe 1)\n");
             wcn7850_send_wmi_service_ready(s, pci_dev);
             s->wmi_service_ready_pending = false;
         }
@@ -3582,6 +4204,17 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
     s->mac_addr[5] = 0x01;
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     memcpy(s->mac_addr, s->conf.macaddr.a, 6);
+
+    /* Initialize the simulated AP: an open BSS on channel 36 (5180 MHz). */
+    s->ap_bssid[0] = 0x00; s->ap_bssid[1] = 0x14; s->ap_bssid[2] = 0x6c;
+    s->ap_bssid[3] = 0x9a; s->ap_bssid[4] = 0x00; s->ap_bssid[5] = 0x01;
+    memcpy(s->ap_ssid, "wcn7850-ap", 10);
+    s->ap_ssid_len = 10;
+    s->ap_channel = 36;
+    s->ap_freq = 5180;
+    s->peer_id = 1;
+    s->peer_mapped = false;
+    s->data_offload_enabled = true;
 
     /* Create NetClient for network backend */
     s->nic = qemu_new_nic(&net_wcn7850_info, &s->conf,

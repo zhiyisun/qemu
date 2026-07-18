@@ -195,7 +195,7 @@
 
 #define WMI_SCAN_EVENTID           WMI_EVT_GRP_START_ID(WMI_GRP_SCAN)    /* 0x1001 */
 #define WMI_MGMT_RX_EVENTID        WMI_EVT_GRP_START_ID(WMI_GRP_MGMT)    /* 0x7001 */
-#define WMI_MGMT_TX_SEND_CMDID     (WMI_TLV_CMD(WMI_GRP_MGMT) + 1)       /* 0x7002 */
+#define WMI_MGMT_TX_SEND_CMDID     (WMI_TLV_CMD(WMI_GRP_MGMT) + 7)       /* 0x7008 */
 #define WMI_PEER_ASSOC_CONF_EVENTID (WMI_TLV_CMD(WMI_GRP_PEER) + 5)      /* 0x6006 */
 #define WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
 #define WMI_MGMT_TX_COMPLETION_EVENTID (WMI_TLV_CMD(WMI_GRP_MGMT) + 5)   /* 0x7006 */
@@ -213,10 +213,11 @@
 #define WMI_TAG_SCAN_EVENT          36
 #define WMI_TAG_MGMT_RX_HDR         44
 #define WMI_TAG_ARRAY_BYTE          17
-#define WMI_TAG_PEER_ASSOC_CONF_EVENT 1658
+#define WMI_TAG_PEER_ASSOC_CONF_EVENT 438
 #define WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 1261
-#define WMI_TAG_MGMT_TX_SEND_CMD    1265
-#define WMI_TAG_MGMT_TX_COMPL_EVENT 1266
+#define WMI_TAG_MGMT_TX_SEND_CMD    426
+#define WMI_TAG_MGMT_TX_COMPL_EVENT 427
+#define WMI_TAG_VDEV_START_RESPONSE_EVENT 40
 
 /* HTT T2H message types (subset the model emits) */
 #define HTT_T2H_MSG_TYPE_PEER_MAP   0x0  /* PEER_MAP v1 */
@@ -728,6 +729,8 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
 static void wcn7850_handle_peer_create(WCN7850State *s, PCIDevice *pci_dev,
                                        const uint8_t *payload, uint32_t len);
 static void wcn7850_handle_peer_assoc(WCN7850State *s, PCIDevice *pci_dev,
+                                      const uint8_t *payload, uint32_t len);
+static void wcn7850_handle_vdev_start(WCN7850State *s, PCIDevice *pci_dev,
                                       const uint8_t *payload, uint32_t len);
 static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
                                       const uint8_t *payload, uint32_t len);
@@ -2059,6 +2062,9 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
         qemu_log("WCN: WMI VDEV UP cmd\n");
         /* Fire-and-forget. */
         break;
+    case WMI_VDEV_START_REQUEST_CMDID:
+        wcn7850_handle_vdev_start(s, pci_dev, payload, len);
+        break;
     case WMI_PEER_CREATE_CMDID:
         wcn7850_handle_peer_create(s, pci_dev, payload, len);
         break;
@@ -2110,6 +2116,53 @@ static void wcn7850_send_htt_peer_map(WCN7850State *s, PCIDevice *pci_dev,
     wcn7850_wmi_send_event(s, pci_dev, 1, buf, total);
     fprintf(stderr, "WCN: HTT PEER_MAP v1 vdev=%u peer_id=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
             vdev_id, peer_id, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/* Build and send a WMI_VDEV_START_RESP_EVENT so the driver's
+ * ath12k_mac_vdev_setup_sync() wait_for_completion(&ar->vdev_setup_done)
+ * fires with a success status. Struct order matches the driver's
+ * struct wmi_vdev_start_resp_event (vdev_id, requestor_id, resp_type,
+ * status=0, chain_mask, smps_mode, pdev_id, tx_streams, rx_streams,
+ * max_allowed_tx_power). */
+static void wcn7850_send_vdev_start_resp(WCN7850State *s, PCIDevice *pci_dev,
+                                         uint32_t vdev_id)
+{
+    uint8_t buf[128];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t off = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_VDEV_START_RESP_EVENTID);
+    off += sizeof(*hdr);
+
+    uint32_t tlv_start = off;
+    WmiTlv *tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*tlv);
+    struct {
+        uint32_t vdev_id;
+        uint32_t requestor_id;
+        uint32_t resp_type;
+        uint32_t status;   /* 0 = WMI_VDEV_START_RESPONSE_STATUS_SUCCESS */
+        uint32_t chain_mask;
+        uint32_t smps_mode;
+        uint32_t pdev_id;
+        uint32_t cfgd_tx_streams;
+        uint32_t cfgd_rx_streams;
+        uint32_t max_allowed_tx_power;
+    } QEMU_PACKED resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.vdev_id = cpu_to_le32(vdev_id);
+    memcpy(buf + off, &resp, sizeof(resp));
+    off += sizeof(resp);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_VDEV_START_RESPONSE_EVENT,
+                                          off - (tlv_start + sizeof(*tlv))));
+
+    uint32_t total = off;
+    uint8_t htc_buf[256];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+    fprintf(stderr, "WCN: VDEV START RESP vdev=%u status=0\n", vdev_id);
 }
 
 /* Build and send a WMI_PEER_ASSOC_CONF_EVENT so ath12k_bss_assoc()'s
@@ -2354,6 +2407,22 @@ static void wcn7850_handle_peer_assoc(WCN7850State *s, PCIDevice *pci_dev,
     wcn7850_send_peer_assoc_conf(s, pci_dev, s->vdev_id, s->ap_bssid);
 }
 
+static void wcn7850_handle_vdev_start(WCN7850State *s, PCIDevice *pci_dev,
+                                      const uint8_t *payload, uint32_t len)
+{
+    /* Wire layout: WmiCmdHdr(4) + struct wmi_vdev_start_request_cmd
+     *   { tlv_header(4), vdev_id(4), ... } */
+    uint32_t vdev_id = 0;
+    if (len >= sizeof(WmiCmdHdr) + 8) {
+        const uint8_t *body = payload + sizeof(WmiCmdHdr);
+        vdev_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+    }
+    s->vdev_id = vdev_id;
+    qemu_log("WCN: WMI VDEV START REQUEST vdev=%u\n", vdev_id);
+    /* The driver blocks in ath12k_mac_vdev_setup_sync() on vdev_setup_done. */
+    wcn7850_send_vdev_start_resp(s, pci_dev, vdev_id);
+}
+
 static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
                                       const uint8_t *payload, uint32_t len)
 {
@@ -2420,10 +2489,14 @@ static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
         return;
     const uint8_t *body = payload + sizeof(WmiCmdHdr);
     uint32_t vdev_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+    uint32_t desc_id = le32_to_cpu(*(const uint32_t *)(body + 8));
     uint32_t frame_len = le32_to_cpu(*(const uint32_t *)(body + 24));
-    qemu_log("WCN: WMI MGMT TX vdev=%u frame_len=%u\n", vdev_id, frame_len);
+    qemu_log("WCN: WMI MGMT TX vdev=%u desc_id=%u frame_len=%u\n",
+             vdev_id, desc_id, frame_len);
 
-    /* Emit MGMT_TX_COMPLETION_EVENT so the driver's tx completion fires. */
+    /* Emit MGMT_TX_COMPLETION_EVENT so the driver's tx completion frees the
+     * pending skb. struct wmi_mgmt_tx_compl_event begins with desc_id (the
+     * idr cookie), NOT vdev_id. */
     uint8_t buf[64];
     WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
     uint32_t b = 0;
@@ -2433,13 +2506,14 @@ static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
     WmiTlv *tlv = (WmiTlv *)(buf + b);
     b += sizeof(*tlv);
     struct {
-        uint32_t vdev_id;
-        uint32_t tx_status;
-        uint32_t cookie; /* echoes frame pointer cookie from the cmd */
+        uint32_t desc_id;   /* must match the cmd's desc_id */
+        uint32_t status;    /* 0 = success */
+        uint32_t pdev_id;
+        uint32_t ppdu_id;
+        uint32_t ack_rssi;
     } QEMU_PACKED mc;
-    mc.vdev_id = cpu_to_le32(vdev_id);
-    mc.tx_status = 0;
-    mc.cookie = 0;
+    memset(&mc, 0, sizeof(mc));
+    mc.desc_id = cpu_to_le32(desc_id);
     memcpy(buf + b, &mc, sizeof(mc));
     b += sizeof(mc);
     tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_MGMT_TX_COMPL_EVENT,

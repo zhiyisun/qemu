@@ -220,9 +220,9 @@
 #define WMI_TAG_VDEV_START_RESPONSE_EVENT 40
 
 /* HTT T2H message types (subset the model emits) */
-#define HTT_T2H_MSG_TYPE_PEER_MAP   0x0  /* PEER_MAP v1 */
-#define HTT_T2H_MSG_TYPE_PEER_MAP2  0x1a
-#define HTT_T2H_MSG_TYPE_PEER_MAP3  0x1f
+#define HTT_T2H_MSG_TYPE_PEER_MAP   0x3  /* PEER_MAP v1 */
+#define HTT_T2H_MSG_TYPE_PEER_MAP2  0x1e
+#define HTT_T2H_MSG_TYPE_PEER_MAP3  0x2b
 #define HTT_T2H_MSG_TYPE_VERSION_CONF 0x0  /* version req/conf share msg_type 0 */
 
 /* WMI TLV tags (matching driver enum) */
@@ -706,6 +706,8 @@ typedef struct WCN7850State {
     uint8_t peer_mac[6];      /* the AP peer MAC (== ap_bssid) */
     uint16_t peer_id;         /* firmware-assigned peer id */
     bool peer_mapped;         /* HTT PEER_MAP v1 emitted */
+    uint8_t sta_mac[6];       /* our own STA MAC (learned from mgmt TX SA) */
+    bool sta_mac_valid;
 
     /* scan request details (so we can emit the matching scan events) */
     uint32_t scan_id;
@@ -2098,18 +2100,25 @@ static void wcn7850_send_htt_peer_map(WCN7850State *s, PCIDevice *pci_dev,
 {
     uint8_t buf[32];
     HtcHdr *h = (HtcHdr *)buf;
-    /* HTT T2H PEER_MAP v1 fixed layout (host byte order fields):
-     *   msg_type (1B) | vdev_id (1B) | peer_id (2B) | mac (6B) | ast_hash (4B) */
+    /* HTT T2H PEER_MAP v1: struct htt_t2h_peer_map_event (4 x __le32):
+     *   info : msg_type[7:0], vdev_id[15:8], peer_id[31:16]
+     *   mac_addr_l32 : MAC bytes 0..3
+     *   info1 : mac_h16[15:0], hw_peer_id[31:16]
+     *   info2 : ast_hash[15:0] */
     uint8_t *p = buf + sizeof(*h);
-    p[0] = HTT_T2H_MSG_TYPE_PEER_MAP;          /* msg_type */
-    p[1] = (uint8_t)vdev_id;                    /* vdev_id */
-    p[2] = peer_id & 0xff;                       /* peer_id low */
-    p[3] = (peer_id >> 8) & 0xff;                /* peer_id high */
-    memcpy(p + 4, mac, 6);                       /* peer MAC */
-    /* ast_hash / next_hop (4 bytes) — set to peer_id for simplicity */
-    p[10] = peer_id & 0xff; p[11] = (peer_id >> 8) & 0xff;
-    p[12] = 0; p[13] = 0;
-    uint32_t total = sizeof(*h) + 14;
+    uint32_t info = (HTT_T2H_MSG_TYPE_PEER_MAP & 0xff)
+                    | ((vdev_id & 0xff) << 8)
+                    | ((uint32_t)peer_id << 16);
+    uint32_t mac_l32 = (uint32_t)mac[0] | ((uint32_t)mac[1] << 8)
+                       | ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24);
+    uint32_t info1 = ((uint32_t)mac[4] | ((uint32_t)mac[5] << 8))
+                     | ((uint32_t)peer_id << 16);   /* hw_peer_id = peer_id */
+    uint32_t info2 = 0;                              /* ast_hash */
+    *(uint32_t *)(p + 0)  = cpu_to_le32(info);
+    *(uint32_t *)(p + 4)  = cpu_to_le32(mac_l32);
+    *(uint32_t *)(p + 8)  = cpu_to_le32(info1);
+    *(uint32_t *)(p + 12) = cpu_to_le32(info2);
+    uint32_t total = sizeof(*h) + 16;
 
     h->hdr_info = cpu_to_le32((total - sizeof(*h)) << 16 | 1); /* EPID 1 */
     h->ctrl_info = 0;
@@ -2282,38 +2291,11 @@ static void wcn7850_send_scan_event(WCN7850State *s, PCIDevice *pci_dev,
     wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
 }
 
-/* Synthesize a minimal but valid 802.11 Beacon frame for the simulated AP
- * and deliver it via WMI_MGMT_RX_EVENTID so mac80211 builds the BSS. */
-static void wcn7850_send_beacon(WCN7850State *s, PCIDevice *pci_dev)
+/* Wrap a raw 802.11 management frame in WMI_MGMT_RX_EVENTID (MGMT_RX_HDR TLV +
+ * ARRAY_BYTE TLV) and deliver it to the driver as if received over the air. */
+static void wcn7850_send_mgmt_rx(WCN7850State *s, PCIDevice *pci_dev,
+                                 const uint8_t *frame, uint32_t frame_len)
 {
-    /* 802.11 Beacon: MAC header (24B) + timestamp(8) + interval(2) +
-     * capability(2) + SSID IE + supported rates IE + DS IE + (optional RSN). */
-    uint8_t frame[256];
-    uint32_t off = 0;
-    /* MAC header: FC=Beacon(0x80), dur=0, DA=bcast, SA=BSSID, BSSID, seq=0 */
-    frame[off++] = 0x80; frame[off++] = 0x00;
-    frame[off++] = 0x00; frame[off++] = 0x00;
-    memset(frame + off, 0xff, 6); off += 6;            /* DA = broadcast */
-    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* SA = BSSID */
-    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* BSSID */
-    frame[off++] = 0x00; frame[off++] = 0x00;          /* seq */
-    /* beacon interval = 100 TU */
-    frame[off++] = 0x64; frame[off++] = 0x00;
-    /* capability: ESS(0x0001), short preamble */
-    frame[off++] = 0x01; frame[off++] = 0x00;
-    /* SSID IE (id 0, len, ssid) */
-    frame[off++] = 0x00; frame[off++] = s->ap_ssid_len;
-    memcpy(frame + off, s->ap_ssid, s->ap_ssid_len); off += s->ap_ssid_len;
-    /* Supported rates IE (id 1): 6,9,12,18,24,36,48,54 Mbps */
-    frame[off++] = 0x01; frame[off++] = 8;
-    static const uint8_t rates[8] = {0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
-    memcpy(frame + off, rates, 8); off += 8;
-    /* DS parameter set IE (id 3): channel */
-    frame[off++] = 0x03; frame[off++] = 1;
-    frame[off++] = (uint8_t)s->ap_channel;
-    uint32_t frame_len = off;
-
-    /* Wrap in WMI_MGMT_RX_EVENTID: MGMT_RX_HDR TLV + ARRAY_BYTE (frame). */
     uint8_t buf[512];
     WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
     uint32_t b = 0;
@@ -2374,8 +2356,91 @@ static void wcn7850_send_beacon(WCN7850State *s, PCIDevice *pci_dev)
     h->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*h), buf, total);
     wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+}
+
+/* Synthesize a minimal but valid 802.11 Beacon frame for the simulated AP
+ * and deliver it via WMI_MGMT_RX_EVENTID so mac80211 builds the BSS. */
+static void wcn7850_send_beacon(WCN7850State *s, PCIDevice *pci_dev)
+{
+    /* 802.11 Beacon: MAC header (24B) + timestamp(8) + interval(2) +
+     * capability(2) + SSID IE + supported rates IE + DS IE + (optional RSN). */
+    uint8_t frame[256];
+    uint32_t off = 0;
+    /* MAC header: FC=Beacon(0x80), dur=0, DA=bcast, SA=BSSID, BSSID, seq=0 */
+    frame[off++] = 0x80; frame[off++] = 0x00;
+    frame[off++] = 0x00; frame[off++] = 0x00;
+    memset(frame + off, 0xff, 6); off += 6;            /* DA = broadcast */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* SA = BSSID */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* BSSID */
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* seq */
+    /* Fixed beacon body: timestamp(8) + beacon interval(2) + capability(2). */
+    memset(frame + off, 0, 8); off += 8;               /* timestamp */
+    /* beacon interval = 100 TU */
+    frame[off++] = 0x64; frame[off++] = 0x00;
+    /* capability: ESS(0x0001) only (open network, no Privacy) */
+    frame[off++] = 0x01; frame[off++] = 0x00;
+    /* SSID IE (id 0, len, ssid) */
+    frame[off++] = 0x00; frame[off++] = s->ap_ssid_len;
+    memcpy(frame + off, s->ap_ssid, s->ap_ssid_len); off += s->ap_ssid_len;
+    /* Supported rates IE (id 1): 6,9,12,18,24,36,48,54 Mbps */
+    frame[off++] = 0x01; frame[off++] = 8;
+    static const uint8_t rates[8] = {0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
+    memcpy(frame + off, rates, 8); off += 8;
+    /* DS parameter set IE (id 3): channel */
+    frame[off++] = 0x03; frame[off++] = 1;
+    frame[off++] = (uint8_t)s->ap_channel;
+    uint32_t frame_len = off;
+
+    wcn7850_send_mgmt_rx(s, pci_dev, frame, frame_len);
     fprintf(stderr, "WCN: MGMT RX beacon sent (chan %u, %u bytes)\n",
             s->ap_channel, frame_len);
+}
+
+/* Deliver an 802.11 Authentication response (open system, seq 2, status 0)
+ * from the AP to our STA so mac80211's authentication completes. */
+static void wcn7850_send_auth_resp(WCN7850State *s, PCIDevice *pci_dev)
+{
+    uint8_t frame[64];
+    uint32_t off = 0;
+    frame[off++] = 0xb0; frame[off++] = 0x00;          /* FC = Auth */
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* duration */
+    memcpy(frame + off, s->sta_mac, 6); off += 6;      /* DA = STA */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* SA = BSSID */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* BSSID */
+    frame[off++] = 0x10; frame[off++] = 0x00;          /* seq ctrl */
+    /* Auth body: algo=0(open), seq=2, status=0 */
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* algorithm */
+    frame[off++] = 0x02; frame[off++] = 0x00;          /* transaction seq */
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* status = success */
+    wcn7850_send_mgmt_rx(s, pci_dev, frame, off);
+    fprintf(stderr, "WCN: MGMT RX auth-resp sent (%u bytes)\n", off);
+}
+
+/* Deliver an 802.11 (Re)Association Response (status 0, AID 1) from the AP so
+ * mac80211's association completes and it proceeds to WMI PEER_ASSOC/VDEV_UP. */
+static void wcn7850_send_assoc_resp(WCN7850State *s, PCIDevice *pci_dev,
+                                    bool reassoc)
+{
+    uint8_t frame[128];
+    uint32_t off = 0;
+    frame[off++] = reassoc ? 0x30 : 0x10;              /* FC = (Re)AssocResp */
+    frame[off++] = 0x00;
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* duration */
+    memcpy(frame + off, s->sta_mac, 6); off += 6;      /* DA = STA */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* SA = BSSID */
+    memcpy(frame + off, s->ap_bssid, 6); off += 6;     /* BSSID */
+    frame[off++] = 0x20; frame[off++] = 0x00;          /* seq ctrl */
+    /* AssocResp body: capability(2), status(2), AID(2) */
+    frame[off++] = 0x01; frame[off++] = 0x00;          /* capability: ESS */
+    frame[off++] = 0x00; frame[off++] = 0x00;          /* status = success */
+    frame[off++] = 0x01; frame[off++] = 0xc0;          /* AID=1 (top 2 bits set) */
+    /* Supported rates IE (must echo so mac80211 accepts operating rates) */
+    frame[off++] = 0x01; frame[off++] = 8;
+    static const uint8_t rates[8] = {0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
+    memcpy(frame + off, rates, 8); off += 8;
+    wcn7850_send_mgmt_rx(s, pci_dev, frame, off);
+    fprintf(stderr, "WCN: MGMT RX assoc-resp sent (reassoc=%d, %u bytes)\n",
+            reassoc, off);
 }
 
 /* WMI command handlers (connect path) */
@@ -2490,9 +2555,30 @@ static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
     const uint8_t *body = payload + sizeof(WmiCmdHdr);
     uint32_t vdev_id = le32_to_cpu(*(const uint32_t *)(body + 4));
     uint32_t desc_id = le32_to_cpu(*(const uint32_t *)(body + 8));
+    uint32_t paddr_lo = le32_to_cpu(*(const uint32_t *)(body + 16));
+    uint32_t paddr_hi = le32_to_cpu(*(const uint32_t *)(body + 20));
     uint32_t frame_len = le32_to_cpu(*(const uint32_t *)(body + 24));
     qemu_log("WCN: WMI MGMT TX vdev=%u desc_id=%u frame_len=%u\n",
              vdev_id, desc_id, frame_len);
+
+    /* DMA-read the outgoing 802.11 frame so we know whether the STA is sending
+     * an Authentication or (Re)Association request, and learn our own MAC. */
+    uint8_t txf[256];
+    uint32_t txlen = frame_len > sizeof(txf) ? sizeof(txf) : frame_len;
+    dma_addr_t fpaddr = ((dma_addr_t)paddr_hi << 32) | paddr_lo;
+    uint8_t subtype = 0xff;
+    bool have_frame = false;
+    if (txlen >= 24 &&
+        pci_dma_read(pci_dev, fpaddr, txf, txlen) == MEMTX_OK) {
+        have_frame = true;
+        subtype = (txf[0] >> 4) & 0xf;   /* mgmt subtype nibble */
+        /* SA (transmitter) is at offset 10 in a mgmt header: that is our STA. */
+        memcpy(s->sta_mac, txf + 10, 6);
+        s->sta_mac_valid = true;
+        qemu_log("WCN: MGMT TX subtype=0x%x sa=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                 subtype, s->sta_mac[0], s->sta_mac[1], s->sta_mac[2],
+                 s->sta_mac[3], s->sta_mac[4], s->sta_mac[5]);
+    }
 
     /* Emit MGMT_TX_COMPLETION_EVENT so the driver's tx completion frees the
      * pending skb. struct wmi_mgmt_tx_compl_event begins with desc_id (the
@@ -2525,6 +2611,20 @@ static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
     h->ctrl_info = 0;
     memcpy(htc_buf + sizeof(*h), buf, total);
     wcn7850_wmi_send_event(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+
+    /* Respond to the STA's management request as the simulated AP would over
+     * the air, so mac80211's SME state machine advances:
+     *   Auth request (subtype 0xb)          -> Auth response (open, success)
+     *   Assoc request (0x0) / Reassoc (0x2) -> (Re)Assoc response (success) */
+    if (have_frame) {
+        if (subtype == 0xb) {
+            wcn7850_send_auth_resp(s, pci_dev);
+        } else if (subtype == 0x0) {
+            wcn7850_send_assoc_resp(s, pci_dev, false);
+        } else if (subtype == 0x2) {
+            wcn7850_send_assoc_resp(s, pci_dev, true);
+        }
+    }
 }
 
 static void wcn7850_handle_install_key(WCN7850State *s, PCIDevice *pci_dev,

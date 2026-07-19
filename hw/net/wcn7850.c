@@ -218,6 +218,7 @@ typedef struct {
 #define WMI_READY_EVENTID          0x2
 #define WMI_INIT_CMDID             0x1
 #define WMI_VDEV_CREATE_CMDID      WMI_TLV_CMD(WMI_GRP_VDEV)
+#define WMI_VDEV_DELETE_CMDID      (WMI_TLV_CMD(WMI_GRP_VDEV) + 1) /* 0x5002 */
 #define WMI_PEER_CREATE_CMDID      WMI_TLV_CMD(WMI_GRP_PEER)
 
 /* Additional WMI command/event IDs used by the STA connect path.
@@ -236,6 +237,7 @@ typedef struct {
 #define WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
 #define WMI_MGMT_TX_COMPLETION_EVENTID (WMI_TLV_CMD(WMI_GRP_MGMT) + 5)   /* 0x7006 */
 #define WMI_VDEV_START_RESP_EVENTID WMI_TLV_CMD(WMI_GRP_VDEV)            /* 0x5001 */
+#define WMI_VDEV_DELETE_RESP_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 5)     /* 0x5006 */
 
 /* WMI scan event types (wmi_scan_event_type) */
 #define WMI_SCAN_EVENT_STARTED      BIT(0)
@@ -254,6 +256,7 @@ typedef struct {
 #define WMI_TAG_MGMT_TX_SEND_CMD    424
 #define WMI_TAG_MGMT_TX_COMPL_EVENT 423
 #define WMI_TAG_VDEV_START_RESPONSE_EVENT 40
+#define WMI_TAG_VDEV_DELETE_RESP_EVENT 452
 
 /* HTT T2H message types (subset the model emits) */
 #define HTT_T2H_MSG_TYPE_PEER_MAP   0x3  /* PEER_MAP v1 */
@@ -754,7 +757,9 @@ static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
 static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
                                    const uint8_t *payload, uint32_t len);
 static void wcn7850_handle_install_key(WCN7850State *s, PCIDevice *pci_dev,
-                                       const uint8_t *payload, uint32_t len);
+                                        const uint8_t *payload, uint32_t len);
+static void wcn7850_send_vdev_delete_resp(WCN7850State *s, PCIDevice *pci_dev,
+                                           uint32_t vdev_id);
 
 /* Read a channel context from host DMA memory */
 static bool wcn7850_read_chan_ctxt(PCIDevice *pci_dev, uint64_t ctxt_addr,
@@ -2033,6 +2038,16 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
         qemu_log("WCN: WMI VDEV CREATE cmd\n");
         /* Fire-and-forget: no response expected by the driver. */
         break;
+    case WMI_VDEV_DELETE_CMDID: {
+        uint32_t vdev_id = 0;
+        if (len >= sizeof(WmiCmdHdr) + 8) {
+            const uint8_t *body = payload + sizeof(WmiCmdHdr);
+            vdev_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+        }
+        qemu_log("WCN: WMI VDEV DELETE cmd vdev=%u\n", vdev_id);
+        wcn7850_send_vdev_delete_resp(s, pci_dev, vdev_id);
+        break;
+    }
     case WMI_VDEV_UP_CMDID:
         qemu_log("WCN: WMI VDEV UP cmd\n");
         /* Fire-and-forget. */
@@ -2218,6 +2233,40 @@ static void wcn7850_send_install_key_compl(WCN7850State *s, PCIDevice *pci_dev,
     memcpy(htc_buf + sizeof(*h), buf, total);
     wcn7850_ce_send(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
     fprintf(stderr, "WCN: INSTALL KEY COMPLETE vdev=%u\n", vdev_id);
+}
+
+/* Build and send a WMI_VDEV_DELETE_RESP_EVENT so the driver's
+ * ath12k_mac_vdev_delete() wait_for_completion(&ar->vdev_delete_done)
+ * fires. The event carries just the vdev_id (WMI_TAG_VDEV_DELETE_RESP_EVENT). */
+static void wcn7850_send_vdev_delete_resp(WCN7850State *s, PCIDevice *pci_dev,
+                                          uint32_t vdev_id)
+{
+    uint8_t buf[64];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t off = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_VDEV_DELETE_RESP_EVENTID);
+    off += sizeof(*hdr);
+
+    uint32_t tlv_start = off;
+    WmiTlv *tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*tlv);
+    struct {
+        uint32_t vdev_id;
+    } QEMU_PACKED del_resp;
+    del_resp.vdev_id = cpu_to_le32(vdev_id);
+    memcpy(buf + off, &del_resp, sizeof(del_resp));
+    off += sizeof(del_resp);
+    tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_VDEV_DELETE_RESP_EVENT,
+                                          off - (tlv_start + sizeof(*tlv))));
+
+    uint32_t total = off;
+    uint8_t htc_buf[256];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_ce_send(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+    fprintf(stderr, "WCN: VDEV DELETE RESP vdev=%u\n", vdev_id);
 }
 
 /* Emit a WMI_SCAN_EVENT with the given event_type/reason. */

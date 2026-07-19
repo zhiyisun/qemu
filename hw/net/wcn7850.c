@@ -209,14 +209,14 @@
 #define WMI_SCAN_REASON_COMPLETED   0x1
 
 /* WMI TLV tags used by the connect path */
-#define WMI_TAG_START_SCAN_CMD      1301
+#define WMI_TAG_START_SCAN_CMD      79
 #define WMI_TAG_SCAN_EVENT          36
 #define WMI_TAG_MGMT_RX_HDR         44
 #define WMI_TAG_ARRAY_BYTE          17
-#define WMI_TAG_PEER_ASSOC_CONF_EVENT 438
+#define WMI_TAG_PEER_ASSOC_CONF_EVENT 434
 #define WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 1261
-#define WMI_TAG_MGMT_TX_SEND_CMD    426
-#define WMI_TAG_MGMT_TX_COMPL_EVENT 427
+#define WMI_TAG_MGMT_TX_SEND_CMD    424
+#define WMI_TAG_MGMT_TX_COMPL_EVENT 423
 #define WMI_TAG_VDEV_START_RESPONSE_EVENT 40
 
 /* HTT T2H message types (subset the model emits) */
@@ -632,6 +632,12 @@ typedef struct WCN7850State {
 
     /* CE poll timer */
     QEMUTimer *ce_poll_timer;
+
+    /* Deferred WMI event (retried via pend_timer when CE dst ring fills up) */
+    QEMUTimer *pend_timer;
+    uint8_t pend_data[2048];
+    uint32_t pend_len;
+    int pend_ce_pipe;
 
     /* ===== CE/HTC/WMI state ===== */
 
@@ -1451,17 +1457,29 @@ static void wcn7850_wmi_send_event(WCN7850State *s, PCIDevice *pci_dev,
 
 	uint64_t buf_addr = (uint64_t)desc.buf_addr_low |
                          ((uint64_t)(desc.buf_addr_info & 0xff) << 32);
-     if (!buf_addr)
+      if (!buf_addr) {
+          /* No CE dst buffer available (driver hasn't posted one yet).
+           * Defer via a timer so the guest can process and repost. */
+         s->pend_ce_pipe = ce_pipe;
+         s->pend_len = data_len > sizeof(s->pend_data) ? sizeof(s->pend_data) : data_len;
+         memcpy(s->pend_data, data, s->pend_len);
+         timer_mod(s->pend_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
          return;
+     }
 
      if (data_len > 2048)
          data_len = 2048;
 
      /* Write WMI data into the buffer */
+    {
+        const uint32_t *data32 = (const uint32_t *)data;
+        const uint32_t *wmihdr = (const uint32_t *)((const uint8_t *)data + 8);
+        fprintf(stderr, "WCN: SEND pipe=%d len=%u cons=%u buf=0x%lx htc=0x%08x wmi=0x%08x\n",
+                ce_pipe, data_len, s->ce_dst_cons[ce_pipe], (unsigned long)buf_addr,
+                data32[0], wmihdr[0]);
+    }
     if (pci_dma_write(pci_dev, buf_addr, data, data_len) != MEMTX_OK)
         return;
-
-    /* Advance consumer pointer and decrement pending count */
     s->ce_dst_cons[ce_pipe] += esize;
     if (s->ce_dst_cons[ce_pipe] >= ring_sz)
         s->ce_dst_cons[ce_pipe] = 0;
@@ -4060,6 +4078,11 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
                     s->ce_dst_pending[ce_pipe] += delta / (s->ce_dst_entry_size[ce_pipe] ?: 16);
                 }
                 s->ce_dst_drv_hp_prev[ce_pipe] = doorbell_bytes;
+                /* Driver just posted new buffers — try to flush any deferred event */
+                if (s->pend_len && s->pend_ce_pipe == ce_pipe) {
+                    fprintf(stderr, "WCN: doorbell trigger pending flush pipe=%d\n", ce_pipe);
+                    timer_mod(s->pend_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+                }
             } else if (ce_type == 2) {
             }
             return;
@@ -4263,6 +4286,68 @@ static void wcn7850_ctrl_event_timer_ext(void *opaque)
     }
 }
 
+/* Timer callback: retry sending a deferred WMI event that failed due to
+ * an empty CE dst ring (see wcn7850_wmi_send_event). */
+static void wcn7850_pend_timer(void *opaque)
+{
+    WCN7850State *s = opaque;
+    if (!s->pend_len)
+        return;
+    PCIDevice *pci_dev = PCI_DEVICE(s);
+    uint32_t pipe = s->pend_ce_pipe;
+    uint64_t base = s->ce_dst_base[pipe];
+    uint32_t esize = s->ce_dst_entry_size[pipe] ?: 16;
+    uint32_t ring_sz = s->ce_dst_size[pipe] ?: (WCN7850_CE_DST_RING_SIZE * esize);
+    if (!base || !ring_sz)
+        return;
+    uint64_t desc_addr = base + s->ce_dst_cons[pipe];
+    struct {
+        uint32_t buf_addr_low;
+        uint32_t buf_addr_info;
+    } desc;
+    if (pci_dma_read(pci_dev, desc_addr, &desc, sizeof(desc)) != MEMTX_OK)
+        return;
+    uint64_t buf_addr = (uint64_t)desc.buf_addr_low |
+                        ((uint64_t)(desc.buf_addr_info & 0xff) << 32);
+    if (!buf_addr) {
+        timer_mod(s->pend_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
+        return;
+    }
+    pci_dma_write(pci_dev, buf_addr, s->pend_data, s->pend_len);
+    s->ce_dst_cons[pipe] += esize;
+    if (s->ce_dst_cons[pipe] >= ring_sz)
+        s->ce_dst_cons[pipe] = 0;
+    if (s->ce_dst_pending[pipe])
+        s->ce_dst_pending[pipe]--;
+    if (s->ce_sts_base[pipe]) {
+        uint32_t sts_esize = s->ce_sts_entry_size[pipe] ?: 16;
+        uint32_t sts_hp = s->ce_sts_hp[pipe];
+        uint8_t sts_desc[16] = {0};
+        *(uint32_t *)sts_desc = cpu_to_le32(s->pend_len << 16);
+        pci_dma_write(pci_dev, s->ce_sts_base[pipe] + sts_hp,
+                      sts_desc, sts_esize);
+        sts_hp += sts_esize;
+        if (s->ce_sts_size[pipe] && sts_hp >= s->ce_sts_size[pipe])
+            sts_hp = 0;
+        s->ce_sts_hp[pipe] = sts_hp;
+        /* RDP write-back of status HP (in words) */
+        if (s->ce_sts_hp_addr[pipe]) {
+            uint32_t sts_hp_words = (sts_hp / sts_esize) * (sts_esize / 4);
+            uint32_t sts_hp_le = cpu_to_le32(sts_hp_words);
+            pci_dma_write(pci_dev, s->ce_sts_hp_addr[pipe],
+                          &sts_hp_le, sizeof(sts_hp_le));
+        }
+    }
+    /* MSI always sent to notify the driver, matching the original
+     * wcn7850_wmi_send_event (msi_notify sent regardless of ce_sts_base). */
+    {
+        int msivec = wcn7850_ce_msi_vector(pipe);
+        msi_notify(pci_dev, msivec);
+    }
+    s->pend_len = 0;
+}
+
 /* CE poll timer: scan CE source rings for new descriptors from driver.
  * Also retries NEW_SERVER when the host (qrtr_mhi) posts DL receive buffers. */
 static void wcn7850_ce_poll_timer(void *opaque)
@@ -4403,6 +4488,9 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
                                         wcn7850_ctrl_event_timer_ext, s);
     s->ce_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                      wcn7850_ce_poll_timer, s);
+    s->pend_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                  wcn7850_pend_timer, s);
+    s->pend_len = 0;
     timer_mod(s->ce_poll_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000LL); /* start 1ms after realize */
     s->qmi_service_active = false;
@@ -4470,6 +4558,7 @@ static void wcn7850_pci_uninit(PCIDevice *pci_dev)
 
     timer_free(s->ctrl_event_timer);
     timer_free(s->ce_poll_timer);
+    timer_free(s->pend_timer);
     g_free(s->bar0_always_on);
     g_free(s->window_memory);
     g_free(s->srng_memory);

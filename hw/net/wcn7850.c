@@ -204,11 +204,12 @@ typedef struct {
 
 /* WMI command groups */
 /* These MUST match the driver's enum wmi_cmd_group */
-#define WMI_GRP_SCAN       0x3
-#define WMI_GRP_PDEV       0x4
-#define WMI_GRP_VDEV       0x5
-#define WMI_GRP_PEER       0x6
-#define WMI_GRP_MGMT       0x7
+ #define WMI_GRP_SCAN       0x3
+ #define WMI_GRP_PDEV       0x4
+ #define WMI_GRP_VDEV       0x5
+ #define WMI_GRP_PEER       0x6
+ #define WMI_GRP_MGMT       0x7
+ #define WMI_GRP_STATS      0x16
 
 #define WMI_TLV_CMD(grp_id) (((grp_id) << 12) | 0x1)
 #define WMI_EVT_GRP_START_ID(grp_id) (((grp_id) << 12) | 0x1)
@@ -238,6 +239,8 @@ typedef struct {
 #define WMI_MGMT_TX_COMPLETION_EVENTID (WMI_TLV_CMD(WMI_GRP_MGMT) + 5)   /* 0x7006 */
 #define WMI_VDEV_START_RESP_EVENTID WMI_TLV_CMD(WMI_GRP_VDEV)            /* 0x5001 */
 #define WMI_VDEV_DELETE_RESP_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 5)     /* 0x5006 */
+#define WMI_REQUEST_STATS_CMDID      WMI_TLV_CMD(WMI_GRP_STATS)          /* 0x16001 */
+#define WMI_UPDATE_STATS_EVENTID     WMI_EVT_GRP_START_ID(WMI_GRP_STATS) /* 0x16001 */
 
 /* WMI scan event types (wmi_scan_event_type) */
 #define WMI_SCAN_EVENT_STARTED      BIT(0)
@@ -250,7 +253,8 @@ typedef struct {
 #define WMI_TAG_START_SCAN_CMD      79
 #define WMI_TAG_SCAN_EVENT          36
 #define WMI_TAG_MGMT_RX_HDR         44
-#define WMI_TAG_ARRAY_BYTE          17
+#define WMI_TAG_ARRAY_BYTE          25
+#define WMI_TAG_STATS_EVENT         72
 #define WMI_TAG_PEER_ASSOC_CONF_EVENT 434
 #define WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 1261
 #define WMI_TAG_MGMT_TX_SEND_CMD    424
@@ -760,6 +764,9 @@ static void wcn7850_handle_install_key(WCN7850State *s, PCIDevice *pci_dev,
                                         const uint8_t *payload, uint32_t len);
 static void wcn7850_send_vdev_delete_resp(WCN7850State *s, PCIDevice *pci_dev,
                                            uint32_t vdev_id);
+static void wcn7850_send_stats_resp(WCN7850State *s, PCIDevice *pci_dev,
+                                    uint32_t stats_id, uint32_t vdev_id,
+                                    uint32_t pdev_id);
 
 /* Read a channel context from host DMA memory */
 static bool wcn7850_read_chan_ctxt(PCIDevice *pci_dev, uint64_t ctxt_addr,
@@ -1446,6 +1453,28 @@ static void wcn7850_ce_send(WCN7850State *s, PCIDevice *pci_dev,
     if (s->ce_dst[ce_pipe].pending)
         s->ce_dst[ce_pipe].pending--;
 
+    /* Advance the ring's tail pointer so the driver sees free RX-buffer
+     * space. For a CE DEST ring the driver posts empty buffers (producer)
+     * and the device (us) consumes them. The driver's
+     * ath12k_hal_srng_src_num_free() computes free entries from
+     * tp = *srng->u.src_ring.tp_addr (the pointer the *device* writes) minus
+     * hp (the driver's local producer position). If we never write our
+     * consume position back to hp_addr (== the DST ring's TP/RDP register),
+     * tp stays at 0 and the ring looks permanently full, so
+     * ath12k_ce_rx_post_pipe() returns -ENOSPC ("failed to enqueue rx buf"),
+     * starving subsequent WMI RX deliveries. The HAL keeps this pointer in
+     * byte units (ath12k_hal_srng_src_num_free reads tp_addr raw, and
+     * srng->u.src_ring.hp is initialised to 0). Write cons (bytes) back. */
+    {
+        uint32_t hp_bytes = s->ce_dst[ce_pipe].cons;
+        s->ce_dst[ce_pipe].hp = hp_bytes;
+        if (s->ce_dst[ce_pipe].hp_addr) {
+            uint32_t hp_le = cpu_to_le32(hp_bytes);
+            pci_dma_write(pci_dev, s->ce_dst[ce_pipe].hp_addr,
+                          &hp_le, sizeof(hp_le));
+        }
+    }
+
     /* Write CE dst status descriptor and advance STATUS HP */
     if (s->ce_sts[ce_pipe].base) {
         uint32_t sts_esize = s->ce_sts[ce_pipe].entry_size ?: 16;
@@ -2048,6 +2077,20 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
         wcn7850_send_vdev_delete_resp(s, pci_dev, vdev_id);
         break;
     }
+    case WMI_REQUEST_STATS_CMDID: {
+        uint32_t stats_id = 0, vdev_id = 0, pdev_id = 0;
+        if (len >= sizeof(WmiCmdHdr) + 12) {
+            const uint8_t *body = payload + sizeof(WmiCmdHdr);
+            stats_id = le32_to_cpu(*(const uint32_t *)(body + 0));
+            vdev_id  = le32_to_cpu(*(const uint32_t *)(body + 4));
+            /* pdev_id is after peer_macaddr (WMI_MAC_ADDR_LEN=6, padded) */
+            pdev_id  = le32_to_cpu(*(const uint32_t *)(body + 4 + 8));
+        }
+        qemu_log("WCN: WMI REQUEST STATS cmd stats_id=0x%x vdev=%u pdev=%u\n",
+                 stats_id, vdev_id, pdev_id);
+        wcn7850_send_stats_resp(s, pci_dev, stats_id, vdev_id, pdev_id);
+        break;
+    }
     case WMI_VDEV_UP_CMDID:
         qemu_log("WCN: WMI VDEV UP cmd\n");
         /* Fire-and-forget. */
@@ -2267,6 +2310,66 @@ static void wcn7850_send_vdev_delete_resp(WCN7850State *s, PCIDevice *pci_dev,
     memcpy(htc_buf + sizeof(*h), buf, total);
     wcn7850_ce_send(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
     fprintf(stderr, "WCN: VDEV DELETE RESP vdev=%u\n", vdev_id);
+}
+
+/* Build and send a WMI_UPDATE_STATS_EVENTID so the driver's
+ * ath12k_mac_get_fw_stats() wait_for_completion(&ar->fw_stats_complete)
+ * fires. The event carries a WMI_TAG_STATS_EVENT header with the requested
+ * stats_id/pdev_id and an (empty) WMI_TAG_ARRAY_BYTE holding the stats data.
+ * num_*_stats are all 0, which is sufficient for the driver's PDEV_STAT and
+ * RSSI_PER_CHAIN_STAT completion paths. */
+static void wcn7850_send_stats_resp(WCN7850State *s, PCIDevice *pci_dev,
+                                    uint32_t stats_id, uint32_t vdev_id,
+                                    uint32_t pdev_id)
+{
+    uint8_t buf[128];
+    WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
+    uint32_t off = 0;
+    hdr->cmd_id = cpu_to_le32(WMI_UPDATE_STATS_EVENTID);
+    off += sizeof(*hdr);
+
+    /* WMI_TAG_STATS_EVENT header TLV */
+    uint32_t stats_tlv_start = off;
+    WmiTlv *stats_tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*stats_tlv);
+    struct {
+        uint32_t stats_id;
+        uint32_t num_pdev_stats;
+        uint32_t num_vdev_stats;
+        uint32_t num_peer_stats;
+        uint32_t num_bcnflt_stats;
+        uint32_t num_chan_stats;
+        uint32_t num_mib_stats;
+        uint32_t pdev_id;
+        uint32_t num_bcn_stats;
+        uint32_t num_peer_extd_stats;
+        uint32_t num_peer_extd2_stats;
+    } QEMU_PACKED sev;
+    memset(&sev, 0, sizeof(sev));
+    sev.stats_id = cpu_to_le32(stats_id);
+    sev.pdev_id = cpu_to_le32(pdev_id ? pdev_id : 0);
+    memcpy(buf + off, &sev, sizeof(sev));
+    off += sizeof(sev);
+    stats_tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_STATS_EVENT,
+                                               off - (stats_tlv_start + sizeof(*stats_tlv))));
+
+    /* WMI_TAG_ARRAY_BYTE holding the (empty) stats data array */
+    uint32_t arr_tlv_start = off;
+    WmiTlv *arr_tlv = (WmiTlv *)(buf + off);
+    off += sizeof(*arr_tlv);
+    /* no stats data: num_*_stats are all 0 */
+    arr_tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_ARRAY_BYTE,
+                                              off - (arr_tlv_start + sizeof(*arr_tlv))));
+
+    uint32_t total = off;
+    uint8_t htc_buf[256];
+    HtcHdr *h = (HtcHdr *)htc_buf;
+    h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
+    h->ctrl_info = 0;
+    memcpy(htc_buf + sizeof(*h), buf, total);
+    wcn7850_ce_send(s, pci_dev, 2, htc_buf, sizeof(*h) + total);
+    fprintf(stderr, "WCN: STATS RESP stats_id=0x%x vdev=%u pdev=%u\n",
+            stats_id, vdev_id, pdev_id);
 }
 
 /* Emit a WMI_SCAN_EVENT with the given event_type/reason. */

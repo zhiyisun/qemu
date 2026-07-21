@@ -229,7 +229,7 @@ typedef struct {
 #define WMI_VDEV_START_REQUEST_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
 #define WMI_VDEV_UP_CMDID          (WMI_TLV_CMD(WMI_GRP_VDEV) + 4)  /* 0x5005 */
 #define WMI_PEER_ASSOC_CMDID       (WMI_TLV_CMD(WMI_GRP_PEER) + 4)  /* 0x6005 */
-#define WMI_VDEV_INSTALL_KEY_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 0xd) /* 0x500e */
+#define WMI_VDEV_INSTALL_KEY_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 8)   /* 0x5009 */
 
 #define WMI_SCAN_EVENTID           WMI_EVT_GRP_START_ID(WMI_GRP_SCAN)    /* 0x1001 */
 #define WMI_MGMT_RX_EVENTID        WMI_EVT_GRP_START_ID(WMI_GRP_MGMT)    /* 0x7001 */
@@ -239,8 +239,12 @@ typedef struct {
 #define WMI_MGMT_TX_COMPLETION_EVENTID (WMI_TLV_CMD(WMI_GRP_MGMT) + 5)   /* 0x7006 */
 #define WMI_VDEV_START_RESP_EVENTID WMI_TLV_CMD(WMI_GRP_VDEV)            /* 0x5001 */
 #define WMI_VDEV_DELETE_RESP_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 5)     /* 0x5006 */
+#define WMI_REQUEST_PDEV_STAT        BIT(2)                               /* 0x4     */
 #define WMI_REQUEST_STATS_CMDID      WMI_TLV_CMD(WMI_GRP_STATS)          /* 0x16001 */
-#define WMI_UPDATE_STATS_EVENTID     WMI_EVT_GRP_START_ID(WMI_GRP_STATS) /* 0x16001 */
+/* Not derivable from the group macro: the stats event enum has explicit
+ * group assignments between WMI_STATS_EXT_EVENTID (0x16001) and
+ * WMI_UPDATE_STATS_EVENTID, so its real value is 0x1d004 in wmi.h. */
+#define WMI_UPDATE_STATS_EVENTID     0x1d004
 
 /* WMI scan event types (wmi_scan_event_type) */
 #define WMI_SCAN_EVENT_STARTED      BIT(0)
@@ -250,17 +254,17 @@ typedef struct {
 #define WMI_SCAN_REASON_COMPLETED   0x1
 
 /* WMI TLV tags used by the connect path */
-#define WMI_TAG_START_SCAN_CMD      79
+#define WMI_TAG_START_SCAN_CMD      77
 #define WMI_TAG_SCAN_EVENT          36
 #define WMI_TAG_MGMT_RX_HDR         44
-#define WMI_TAG_ARRAY_BYTE          25
-#define WMI_TAG_STATS_EVENT         72
+#define WMI_TAG_ARRAY_BYTE          17
+#define WMI_TAG_STATS_EVENT         70
 #define WMI_TAG_PEER_ASSOC_CONF_EVENT 434
-#define WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 1261
-#define WMI_TAG_MGMT_TX_SEND_CMD    424
+#define WMI_TAG_VDEV_INSTALL_KEY_COMPLETE_EVENT 42
+#define WMI_TAG_MGMT_TX_SEND_CMD    422
 #define WMI_TAG_MGMT_TX_COMPL_EVENT 423
 #define WMI_TAG_VDEV_START_RESPONSE_EVENT 40
-#define WMI_TAG_VDEV_DELETE_RESP_EVENT 452
+#define WMI_TAG_VDEV_DELETE_RESP_EVENT 450
 
 /* HTT T2H message types (subset the model emits) */
 #define HTT_T2H_MSG_TYPE_PEER_MAP   0x3  /* PEER_MAP v1 */
@@ -1470,8 +1474,13 @@ static void wcn7850_ce_send(WCN7850State *s, PCIDevice *pci_dev,
         s->ce_dst[ce_pipe].hp = hp_bytes;
         if (s->ce_dst[ce_pipe].hp_addr) {
             uint32_t hp_le = cpu_to_le32(hp_bytes);
+            fprintf(stderr, "WCN: write dst hp pipe=%d addr=0x%lx val=%u\n",
+                    ce_pipe, (unsigned long)s->ce_dst[ce_pipe].hp_addr, hp_bytes);
             pci_dma_write(pci_dev, s->ce_dst[ce_pipe].hp_addr,
                           &hp_le, sizeof(hp_le));
+        } else {
+            fprintf(stderr, "WCN: dst hp_addr=0 pipe=%d cons=%u (writeback SKIPPED)\n",
+                    ce_pipe, hp_bytes);
         }
     }
 
@@ -1790,6 +1799,12 @@ static void wcn7850_send_wmi_service_ready(WCN7850State *s, PCIDevice *pci_dev)
 
     uint32_t total_len = off;
 
+    fprintf(stderr, "WCN: WMI_SERVICE_READY total_len=%u\n", total_len);
+    for (int i = 0; i < (int)total_len && i < 144; i += 4) {
+        fprintf(stderr, "WCN:  wmi_rdy[%02d] 0x%08x\n", i,
+                le32_to_cpu(*(uint32_t *)(buf + i)));
+    }
+
     /* Wrap in HTC header for EP 2 (WMI RX) */
     uint8_t htc_buf[2048];
     HtcHdr *hdr2 = (HtcHdr *)htc_buf;
@@ -1914,6 +1929,12 @@ static void wcn7850_send_wmi_service_ready_ext(WCN7850State *s, PCIDevice *pci_d
 #undef CLOSE_TLV
 
     uint32_t total_len = off;
+
+    fprintf(stderr, "WCN: WMI_SERVICE_READY_EXT total_len=%u\n", total_len);
+    for (int i = 0; i < (int)total_len && i < 120; i += 4) {
+        fprintf(stderr, "WCN:  wmi_rdy_ext[%02d] 0x%08x\n", i,
+                le32_to_cpu(*(uint32_t *)(buf + i)));
+    }
 
     uint8_t htc_buf[2048];
     HtcHdr *h2 = (HtcHdr *)htc_buf;
@@ -2079,12 +2100,14 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
     }
     case WMI_REQUEST_STATS_CMDID: {
         uint32_t stats_id = 0, vdev_id = 0, pdev_id = 0;
-        if (len >= sizeof(WmiCmdHdr) + 12) {
+        /* Wire: WmiCmdHdr(4) + tlv_header(4) + struct wmi_request_stats_cmd
+         *   { tlv_header(4), stats_id(4), vdev_id(4),
+         *     peer_macaddr(8), pdev_id(4) } */
+        if (len >= sizeof(WmiCmdHdr) + 24) {
             const uint8_t *body = payload + sizeof(WmiCmdHdr);
-            stats_id = le32_to_cpu(*(const uint32_t *)(body + 0));
-            vdev_id  = le32_to_cpu(*(const uint32_t *)(body + 4));
-            /* pdev_id is after peer_macaddr (WMI_MAC_ADDR_LEN=6, padded) */
-            pdev_id  = le32_to_cpu(*(const uint32_t *)(body + 4 + 8));
+            stats_id = le32_to_cpu(*(const uint32_t *)(body + 4));
+            vdev_id  = le32_to_cpu(*(const uint32_t *)(body + 8));
+            pdev_id  = le32_to_cpu(*(const uint32_t *)(body + 20));
         }
         qemu_log("WCN: WMI REQUEST STATS cmd stats_id=0x%x vdev=%u pdev=%u\n",
                  stats_id, vdev_id, pdev_id);
@@ -2313,16 +2336,70 @@ static void wcn7850_send_vdev_delete_resp(WCN7850State *s, PCIDevice *pci_dev,
 }
 
 /* Build and send a WMI_UPDATE_STATS_EVENTID so the driver's
- * ath12k_mac_get_fw_stats() wait_for_completion(&ar->fw_stats_complete)
- * fires. The event carries a WMI_TAG_STATS_EVENT header with the requested
- * stats_id/pdev_id and an (empty) WMI_TAG_ARRAY_BYTE holding the stats data.
- * num_*_stats are all 0, which is sufficient for the driver's PDEV_STAT and
- * RSSI_PER_CHAIN_STAT completion paths. */
+ * ath12k_mac_get_fw_stats() wait_for_completion() fires. The event carries
+ * one zeroed pdev stats entry so the driver's pdev parse loop sets
+ * stats->stats_id = WMI_REQUEST_PDEV_STAT, and the PDEV_STAT branch in
+ * ath12k_update_stats_event unconditionally completes fw_stats_done. */
 static void wcn7850_send_stats_resp(WCN7850State *s, PCIDevice *pci_dev,
                                     uint32_t stats_id, uint32_t vdev_id,
                                     uint32_t pdev_id)
 {
-    uint8_t buf[128];
+    /* Mirror struct ath12k_wmi_pdev_stats_params from driver wmi.h */
+    struct {
+        struct {
+            int32_t  chan_nf;
+            uint32_t tx_frame_count;
+            uint32_t rx_frame_count;
+            uint32_t rx_clear_count;
+            uint32_t cycle_count;
+            uint32_t phy_err_count;
+            uint32_t chan_tx_pwr;
+        } QEMU_PACKED base;
+        struct {
+            int32_t  comp_queued;
+            int32_t  comp_delivered;
+            int32_t  msdu_enqued;
+            int32_t  mpdu_enqued;
+            int32_t  wmm_drop;
+            int32_t  local_enqued;
+            int32_t  local_freed;
+            int32_t  hw_queued;
+            int32_t  hw_reaped;
+            int32_t  underrun;
+            int32_t  tx_abort;
+            int32_t  mpdus_requed;
+            uint32_t tx_ko;
+            uint32_t data_rc;
+            uint32_t self_triggers;
+            uint32_t sw_retry_failure;
+            uint32_t illgl_rate_phy_err;
+            uint32_t pdev_cont_xretry;
+            uint32_t pdev_tx_timeout;
+            uint32_t pdev_resets;
+            uint32_t stateless_tid_alloc_failure;
+            uint32_t phy_underrun;
+            uint32_t txop_ovf;
+        } QEMU_PACKED tx;
+        struct {
+            int32_t  mid_ppdu_route_change;
+            int32_t  status_rcvd;
+            int32_t  r0_frags;
+            int32_t  r1_frags;
+            int32_t  r2_frags;
+            int32_t  r3_frags;
+            int32_t  htt_msdus;
+            int32_t  htt_mpdus;
+            int32_t  loc_msdus;
+            int32_t  loc_mpdus;
+            int32_t  oversize_amsdu;
+            int32_t  phy_errs;
+            int32_t  phy_err_drop;
+            int32_t  mpdu_errs;
+        } QEMU_PACKED rx;
+    } QEMU_PACKED pdev_stat;
+#define WCN_PDEV_STAT_SZ (sizeof(pdev_stat))
+
+    uint8_t buf[512];
     WmiCmdHdr *hdr = (WmiCmdHdr *)buf;
     uint32_t off = 0;
     hdr->cmd_id = cpu_to_le32(WMI_UPDATE_STATS_EVENTID);
@@ -2346,23 +2423,27 @@ static void wcn7850_send_stats_resp(WCN7850State *s, PCIDevice *pci_dev,
         uint32_t num_peer_extd2_stats;
     } QEMU_PACKED sev;
     memset(&sev, 0, sizeof(sev));
-    sev.stats_id = cpu_to_le32(stats_id);
+    sev.stats_id = cpu_to_le32(WMI_REQUEST_PDEV_STAT);
+    sev.num_pdev_stats = cpu_to_le32(1);
     sev.pdev_id = cpu_to_le32(pdev_id ? pdev_id : 0);
     memcpy(buf + off, &sev, sizeof(sev));
     off += sizeof(sev);
     stats_tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_STATS_EVENT,
                                                off - (stats_tlv_start + sizeof(*stats_tlv))));
 
-    /* WMI_TAG_ARRAY_BYTE holding the (empty) stats data array */
+    /* WMI_TAG_ARRAY_BYTE with one zeroed pdev stats entry so the pdev
+     * parse loop sets stats->stats_id = WMI_REQUEST_PDEV_STAT. */
     uint32_t arr_tlv_start = off;
     WmiTlv *arr_tlv = (WmiTlv *)(buf + off);
     off += sizeof(*arr_tlv);
-    /* no stats data: num_*_stats are all 0 */
+    memset(&pdev_stat, 0, sizeof(pdev_stat));
+    memcpy(buf + off, &pdev_stat, sizeof(pdev_stat));
+    off += sizeof(pdev_stat);
     arr_tlv->header = cpu_to_le32(WMI_TLV_HDR(WMI_TAG_ARRAY_BYTE,
                                               off - (arr_tlv_start + sizeof(*arr_tlv))));
 
     uint32_t total = off;
-    uint8_t htc_buf[256];
+    uint8_t htc_buf[512];
     HtcHdr *h = (HtcHdr *)htc_buf;
     h->hdr_info = cpu_to_le32((total << 16) | HTC_EP_WMI);
     h->ctrl_info = 0;
@@ -2988,8 +3069,9 @@ static void wcn7850_handle_ce_mmio(WCN7850State *s, PCIDevice *pci_dev,
                     s->ce_dst[ce_pipe].entry_size = entry_size;
                     if (hp_addr)
                         s->ce_dst[ce_pipe].hp_addr = hp_addr;
-                    fprintf(stderr, "WCN: CE dst cfg pipe=%d base=0x%lx sz=%u esz=%u\n",
-                             ce_pipe, (unsigned long)base_addr, ring_sz_bytes, entry_size);
+                    fprintf(stderr, "WCN: CE dst cfg pipe=%d base=0x%lx sz=%u esz=%u hp_addr=0x%lx\n",
+                             ce_pipe, (unsigned long)base_addr, ring_sz_bytes, entry_size,
+                             (unsigned long)hp_addr);
                 } else {
                     s->ce_src[ce_pipe].base = base_addr;
                     s->ce_src[ce_pipe].size = ring_sz_bytes;
@@ -3205,9 +3287,6 @@ static uint32_t wcn7850_qmi_build_phy_cap_resp(uint8_t *buf, uint32_t buf_size,
     uint8_t *tlv;
     uint32_t total;
 
-    /* TLVs: result(7) + num_phy(4) + board_id(7) + single_chip_mlo_support(4)
-     * Optional fields carry NO validity prefix on the wire; the TLV's
-     * presence alone signals validity to the vanilla QMI decoder. */
     uint32_t tlv_len = 7 + 4 + 7 + 4;
     total = sizeof(*hdr) + tlv_len;
     if (total > buf_size)
@@ -3223,15 +3302,17 @@ static uint32_t wcn7850_qmi_build_phy_cap_resp(uint8_t *buf, uint32_t buf_size,
     tlv[0] = 0x02; tlv[1] = 0x04; tlv[2] = 0x00;
     tlv[3] = 0x00; tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00;
     tlv += 7;
-    /* TLV type 0x10: num_phy, length 1 = value(1) */
+    /* TLV type 0x10: num_phy(1). No opt_flag byte on the wire; the
+     * decoder sets num_phy_valid=1 internally (QMI_OPT_FLAG consumes no
+     * bytes). */
     tlv[0] = 0x10; tlv[1] = 0x01; tlv[2] = 0x00;
     tlv[3] = 0x01; /* num_phy = 1 */
     tlv += 4;
-    /* TLV type 0x11: board_id, length 4 = board_id(4) */
+    /* TLV type 0x11: board_id(4) */
     tlv[0] = 0x11; tlv[1] = 0x04; tlv[2] = 0x00;
     tlv[3] = 0x00; tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00; /* board_id = 0 */
     tlv += 7;
-    /* TLV type 0x13: single_chip_mlo_support, length 1 = value(1) */
+    /* TLV type 0x13: single_chip_mlo_support(1) */
     tlv[0] = 0x13; tlv[1] = 0x01; tlv[2] = 0x00;
     tlv[3] = 0x00; /* single_chip_mlo_support = false */
 
@@ -3244,18 +3325,13 @@ static uint32_t wcn7850_qmi_build_cap_resp(uint8_t *buf, uint32_t buf_size,
 {
     QmiHdr *hdr = (QmiHdr *)buf;
     uint8_t *tlv;
-    /* result + chip_info(8) + board_info(4) + fw_version_info(4+1+9)
-     * Optional fields carry NO validity prefix on the wire; the TLV's
-     * presence alone signals validity to the vanilla QMI decoder. */
     const char *fw_ts = "2025-01-01";
     uint8_t fw_ts_len = strlen(fw_ts);
     uint32_t tlv_val = 0;
     uint32_t tlv_len = 0;
 
-    /* result TLV (type=0x02, val=4 bytes): 3 header + 4 = 7 */
-    /* chip_info TLV (type=0x10): chip_id(4) + chip_family(4) = 8 */
-    /* board_info TLV (type=0x11): board_id(4) = 4 */
-    /* fw_version_info TLV (type=0x13): fw_version(4) + string_len(1) + fw_ts_len */
+    /* No opt_flag bytes on the wire: the decoder sets the *_valid flags
+     * internally (QMI_OPT_FLAG consumes no bytes). */
     tlv_len = 7 + (3 + 8) + (3 + 4) + (3 + 4 + 1 + fw_ts_len);
     uint32_t total = sizeof(*hdr) + tlv_len;
 
@@ -3272,19 +3348,19 @@ static uint32_t wcn7850_qmi_build_cap_resp(uint8_t *buf, uint32_t buf_size,
     tlv[0] = 0x02; tlv[1] = 0x04; tlv[2] = 0x00;
     tlv[3] = 0x00; tlv[4] = 0x00; tlv[5] = 0x00; tlv[6] = 0x00;
     tlv += 7;
-    /* TLV: chip_info (type 0x10, len 0x08): chip_id(4) + chip_family(4) */
+    /* TLV: chip_info (type 0x10, len 8): chip_id(4)+chip_family(4) */
     tlv[0] = 0x10; tlv[1] = 8; tlv[2] = 0x00;
     tlv_val = cpu_to_le32(2);
     memcpy(&tlv[3], &tlv_val, 4); /* chip_id = 2 */
     tlv_val = cpu_to_le32(0);
     memcpy(&tlv[7], &tlv_val, 4); /* chip_family = 0 */
     tlv += 3 + 8;
-    /* TLV: board_info (type 0x11, len 0x04): board_id(4) */
+    /* TLV: board_info (type 0x11, len 4): board_id(4) */
     tlv[0] = 0x11; tlv[1] = 4; tlv[2] = 0x00;
     tlv_val = cpu_to_le32(0);
     memcpy(&tlv[3], &tlv_val, 4); /* board_id = 0 */
     tlv += 3 + 4;
-    /* TLV: fw_version_info (type 0x13): fw_version(4) + string */
+    /* TLV: fw_version_info (type 0x13): fw_version(4)+string(len(1)+bytes) */
     tlv[0] = 0x13;
     tlv[1] = (4 + 1 + fw_ts_len) & 0xff;
     tlv[2] = ((4 + 1 + fw_ts_len) >> 8) & 0xff;
@@ -4660,8 +4736,8 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
     /* Channel 40 (5200 MHz): the driver's advertised 5GHz scan list starts
      * at 5200 (channel 36/5180 is not scanned), so the AP must live on a
      * channel that mac80211 actually visits for the beacon to register a BSS. */
-    s->ap_channel = 40;
-    s->ap_freq = 5200;
+    s->ap_channel = 6;
+    s->ap_freq = 2437;
     s->peer_id = 1;
     s->peer_mapped = false;
     s->data_offload_enabled = true;

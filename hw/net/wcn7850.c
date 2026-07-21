@@ -275,8 +275,9 @@ typedef struct {
 #define HTT_T2H_MSG_TYPE_VERSION_CONF 0x0  /* version req/conf share msg_type 0 */
 
 /* HTT H2T message types the model handles */
-#define HTT_H2T_MSG_TYPE_VERSION_REQ    0x0
-#define HTT_H2T_MSG_TYPE_SRING_SETUP    0xb
+#define HTT_H2T_MSG_TYPE_VERSION_REQ            0x0
+#define HTT_H2T_MSG_TYPE_SRING_SETUP            0xb
+#define HTT_H2T_MSG_TYPE_RX_RING_SELECTION_CFG  0xc
 
 /* HTT SRNG ring IDs (sequential — no gaps, from kernel's enum htt_srng_ring_id) */
 #define HTT_RXDMA_HOST_BUF_RING         0
@@ -2896,6 +2897,20 @@ static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
         *ver = cpu_to_le32((3 << 16) | (0 << 8));  /* major 3, minor 0 */
         wcn7850_ce_send(s, pci_dev, 1, buf, sizeof(HtcHdr) + 4);
 
+    } else if (msg_type == HTT_H2T_MSG_TYPE_RX_RING_SELECTION_CFG) {
+        if (len < 4) {
+            return;
+        }
+        const uint32_t *dw = (const uint32_t *)(payload);
+        uint32_t info0 = le32_to_cpu(dw[0]);
+        uint32_t ring_id = (info0 >> 16) & 0xff;
+        uint32_t pdev_id = (info0 >> 8) & 0xff;
+        uint32_t ss = (info0 >> 24) & 1;
+        uint32_t ps = (info0 >> 25) & 1;
+        uint32_t rxmon = (info0 >> 28) & 1;
+        qemu_log("WCN: HTT ring_sel_cfg ring_id=%u pdev=%u ss=%u ps=%u rxmon=%u\n",
+                 ring_id, pdev_id, ss, ps, rxmon);
+
     } else if (msg_type == HTT_H2T_MSG_TYPE_SRING_SETUP) {
         if (len < HTT_SRING_SETUP_MSG_LEN) {
             return;
@@ -2920,31 +2935,31 @@ static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
         uint64_t tp_addr       = ((uint64_t)tp_hi << 32) | tp_lo;
 
         /* Map HTT ring ID to model ring type + index.
-         * For WCN7850 (rx_mac_buf_ring=true):
-         *   ring_id=5 (HTT_HOST1_TO_FW_RXBUF_RING, SW_TO_SW)  → RXDMA_BUF ring 0
-         *   ring_id=0 (HTT_RXDMA_HOST_BUF_RING, SW_TO_HW)     → RXDMA_BUF ring 1
-         * For other configs (rx_mac_buf_ring=false):
-         *   ring_id=0 (HTT_RXDMA_HOST_BUF_RING, SW_TO_HW)     → RXDMA_BUF ring 0 */
+         * For WCN7850 with rx_mac_buf_ring=true the driver sets up two RXDMA
+         * host buf rings (one per mac_id).  The firmware-facing SW_TO_SW ring
+         * (HOST1_TO_FW, ring_id=5) is index 0.  Each HW-facing host buf ring
+         * (RXDMA_HOST_BUF_RING, ring_id=0) gets a unique index equal to its
+         * pdev_id (1 or 2). */
         Wcn7850RingType ring_type = WCN7850_RING_UNKNOWN;
         int ring_idx = 0;
         switch (htt_ring_id) {
         case HTT_RXDMA_HOST_BUF_RING:
-            /* When preceded by a SW_TO_SW ring_id=5 (HTT_HOST1_TO_FW),
-             * this is the second RXDMA buf ring (index 1). Otherwise index 0. */
+            /* Each mac_id gets its own HW-facing RXDMA buf ring.
+             * pdev_id distinguishes mac_id 0 from mac_id 1. */
             ring_type = WCN7850_RING_RXDMA_BUF;
-            ring_idx = 1;  /* second mac buf ring (HW-facing) */
+            ring_idx = pdev_id;
             break;
         case HTT_RXDMA_HOST_BUF_RING2:
             ring_type = WCN7850_RING_RXDMA_BUF;
-            ring_idx = 2;
+            ring_idx = 3;
             break;
         case HTT_HOST1_TO_FW_RXBUF_RING:
             ring_type = WCN7850_RING_RXDMA_BUF;
-            ring_idx = 0;  /* first mac buf ring (FW-facing) */
+            ring_idx = 0;
             break;
         case HTT_HOST2_TO_FW_RXBUF_RING:
             ring_type = WCN7850_RING_RXDMA_BUF;
-            ring_idx = 1;
+            ring_idx = 2;
             break;
         case HTT_RXDMA_NON_MONITOR_DEST_RING:
         case HTT_RXDMA_MONITOR_STATUS_RING:

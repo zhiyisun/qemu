@@ -274,6 +274,37 @@ typedef struct {
 #define HTT_T2H_MSG_TYPE_PEER_MAP3  0x2b
 #define HTT_T2H_MSG_TYPE_VERSION_CONF 0x0  /* version req/conf share msg_type 0 */
 
+/* HTT H2T message types the model handles */
+#define HTT_H2T_MSG_TYPE_VERSION_REQ    0x0
+#define HTT_H2T_MSG_TYPE_SRING_SETUP    0xb
+
+/* HTT SRNG ring IDs (sequential — no gaps, from kernel's enum htt_srng_ring_id) */
+#define HTT_RXDMA_HOST_BUF_RING         0
+#define HTT_RXDMA_MONITOR_STATUS_RING   1
+#define HTT_RXDMA_MONITOR_BUF_RING      2
+#define HTT_RXDMA_MONITOR_DESC_RING     3
+#define HTT_RXDMA_MONITOR_DEST_RING     4
+#define HTT_HOST1_TO_FW_RXBUF_RING      5
+#define HTT_HOST2_TO_FW_RXBUF_RING      6
+#define HTT_RXDMA_NON_MONITOR_DEST_RING 7
+#define HTT_RXDMA_HOST_BUF_RING2        8
+
+/* HTT SRING_SETUP message bitfields (mirror driver dp_htt.h) */
+/* ring_type values */
+#define HTT_HW_TO_SW_RING   0
+#define HTT_SW_TO_HW_RING   1
+#define HTT_SW_TO_SW_RING   2
+
+#define HTT_SRNG_SETUP_INFO0_MSG_TYPE   0xff
+#define HTT_SRNG_SETUP_INFO0_PDEV_ID    (0xff << 8)
+#define HTT_SRNG_SETUP_INFO0_RING_ID    (0xff << 16)
+#define HTT_SRNG_SETUP_INFO0_RING_TYPE  (0xff << 24)
+#define HTT_SRNG_SETUP_INFO1_RING_SIZE  0xffff
+#define HTT_SRNG_SETUP_INFO1_ENTRY_SIZE (0xff << 16)
+
+/* SRING_SETUP message is 13 dwords (52 bytes) */
+#define HTT_SRING_SETUP_MSG_LEN         52
+
 /* WMI TLV tags (matching driver enum) */
 #define WMI_TAG_ARRAY_UINT32              16
 #define WMI_TAG_ARRAY_FIXED_STRUCT        19
@@ -2844,9 +2875,9 @@ static void wcn7850_handle_install_key(WCN7850State *s, PCIDevice *pci_dev,
 }
 
 /* Handle HTT command from driver (sent via HTC EP HTT on CE pipe 4).
- * The only command during core bring-up is the version request; reply with
- * HTT_T2H_MSG_TYPE_VERSION_CONF so the driver's htt_tgt_version_received
- * completion fires. */
+ * Messages handled:
+ *   0x0 = HTT_H2T_MSG_TYPE_VERSION_REQ — respond with version conf
+ *   0xb = HTT_H2T_MSG_TYPE_SRING_SETUP — record ring config from driver */
 static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
                                    const uint8_t *payload, uint32_t len)
 {
@@ -2854,19 +2885,99 @@ static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
         return;
     }
     uint32_t ver_reg_info = le32_to_cpu(*(const uint32_t *)payload);
-    uint32_t msg_type = ver_reg_info & 0xff;  /* HTT_VER_REQ_INFO_MSG_ID */
+    uint32_t msg_type = ver_reg_info & 0xff;
 
-    if (msg_type == 0) {  /* HTT_H2T_MSG_TYPE_VERSION_REQ */
+    if (msg_type == HTT_H2T_MSG_TYPE_VERSION_REQ) {
         uint8_t buf[16];
         HtcHdr *hdr = (HtcHdr *)buf;
-        /* eid = 1 (HTT), payload_len = 4 */
         hdr->hdr_info = cpu_to_le32((4 << 16) | 1);
         hdr->ctrl_info = 0;
         uint32_t *ver = (uint32_t *)(buf + sizeof(HtcHdr));
-        /* HTT_T2H_VERSION_CONF_MAJOR = bits 23..16, MINOR = bits 15..8 */
         *ver = cpu_to_le32((3 << 16) | (0 << 8));  /* major 3, minor 0 */
-        /* Deliver on CE pipe 1 (HTT / HTC control DL). */
         wcn7850_ce_send(s, pci_dev, 1, buf, sizeof(HtcHdr) + 4);
+
+    } else if (msg_type == HTT_H2T_MSG_TYPE_SRING_SETUP) {
+        if (len < HTT_SRING_SETUP_MSG_LEN) {
+            return;
+        }
+        const uint32_t *dw = (const uint32_t *)(payload);
+        uint32_t info0    = le32_to_cpu(dw[0]);
+        uint32_t base_lo  = le32_to_cpu(dw[1]);
+        uint32_t base_hi  = le32_to_cpu(dw[2]);
+        uint32_t info1    = le32_to_cpu(dw[3]);
+        uint32_t hp_lo    = le32_to_cpu(dw[4]);
+        uint32_t hp_hi    = le32_to_cpu(dw[5]);
+        uint32_t tp_lo    = le32_to_cpu(dw[6]);
+        uint32_t tp_hi    = le32_to_cpu(dw[7]);
+
+        uint32_t htt_ring_type = (info0 >> 24) & 0xff;
+        uint32_t htt_ring_id   = (info0 >> 16) & 0xff;
+        uint32_t pdev_id       = (info0 >> 8) & 0xff;
+        uint64_t base_addr     = ((uint64_t)base_hi << 32) | base_lo;
+        uint32_t ring_size     = info1 & 0xffff;
+        uint32_t entry_sz      = ((info1 >> 16) & 0xff) * 4;
+        uint64_t hp_addr       = ((uint64_t)hp_hi << 32) | hp_lo;
+        uint64_t tp_addr       = ((uint64_t)tp_hi << 32) | tp_lo;
+
+        /* Map HTT ring ID to model ring type + index.
+         * For WCN7850 (rx_mac_buf_ring=true):
+         *   ring_id=5 (HTT_HOST1_TO_FW_RXBUF_RING, SW_TO_SW)  → RXDMA_BUF ring 0
+         *   ring_id=0 (HTT_RXDMA_HOST_BUF_RING, SW_TO_HW)     → RXDMA_BUF ring 1
+         * For other configs (rx_mac_buf_ring=false):
+         *   ring_id=0 (HTT_RXDMA_HOST_BUF_RING, SW_TO_HW)     → RXDMA_BUF ring 0 */
+        Wcn7850RingType ring_type = WCN7850_RING_UNKNOWN;
+        int ring_idx = 0;
+        switch (htt_ring_id) {
+        case HTT_RXDMA_HOST_BUF_RING:
+            /* When preceded by a SW_TO_SW ring_id=5 (HTT_HOST1_TO_FW),
+             * this is the second RXDMA buf ring (index 1). Otherwise index 0. */
+            ring_type = WCN7850_RING_RXDMA_BUF;
+            ring_idx = 1;  /* second mac buf ring (HW-facing) */
+            break;
+        case HTT_RXDMA_HOST_BUF_RING2:
+            ring_type = WCN7850_RING_RXDMA_BUF;
+            ring_idx = 2;
+            break;
+        case HTT_HOST1_TO_FW_RXBUF_RING:
+            ring_type = WCN7850_RING_RXDMA_BUF;
+            ring_idx = 0;  /* first mac buf ring (FW-facing) */
+            break;
+        case HTT_HOST2_TO_FW_RXBUF_RING:
+            ring_type = WCN7850_RING_RXDMA_BUF;
+            ring_idx = 1;
+            break;
+        case HTT_RXDMA_NON_MONITOR_DEST_RING:
+        case HTT_RXDMA_MONITOR_STATUS_RING:
+        case HTT_RXDMA_MONITOR_BUF_RING:
+        case HTT_RXDMA_MONITOR_DESC_RING:
+        case HTT_RXDMA_MONITOR_DEST_RING:
+            /* Already configured via MMIO or not needed for basic data path */
+            break;
+        default:
+            break;
+        }
+
+        if (ring_type != WCN7850_RING_UNKNOWN) {
+            WCN7850RingState *r = wcn7850_add_or_update_ring(s, ring_type, ring_idx);
+            if (r) {
+                r->configured  = true;
+                r->base_addr   = base_addr;
+                r->size        = ring_size;
+                r->entry_size  = entry_sz;
+                r->hp_shadow_addr = hp_addr;
+                r->tp_shadow_addr = tp_addr;
+                r->enable = true;
+                qemu_log("WCN: HTT SRING_SETUP ring_type=%u ring_id=%u pdev=%u"
+                         " base=0x%"PRIx64" sz=%u esz=%u hp=0x%"PRIx64" tp=0x%"PRIx64"\n",
+                         htt_ring_type, htt_ring_id, pdev_id,
+                         base_addr, ring_size, entry_sz, hp_addr, tp_addr);
+            }
+        } else {
+            qemu_log("WCN: HTT SRING_SETUP (untracked) ring_type=%u ring_id=%u"
+                     " pdev=%u base=0x%"PRIx64" sz=%u esz=%u\n",
+                     htt_ring_type, htt_ring_id, pdev_id,
+                     base_addr, ring_size, entry_sz);
+        }
     }
 }
 

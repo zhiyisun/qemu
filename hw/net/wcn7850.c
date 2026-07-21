@@ -353,6 +353,10 @@ typedef enum {
 } Wcn7850RingType;
 
 /* Per-ring tracked state */
+/* Maximum tracked buffer addresses per RXDMA buf ring.
+ * The driver replenishes in batches; this must exceed the max batch size. */
+#define WCN7850_RXDMA_MAX_BUFS  1024
+
 typedef struct {
     bool configured;
     Wcn7850RingType type;
@@ -370,6 +374,9 @@ typedef struct {
     uint32_t tp_mmio_offset;
     uint32_t msivec;
     bool enable;
+    /* RX buffer addresses posted by the driver on RXDMA buf rings */
+    uint64_t buf_addrs[WCN7850_RXDMA_MAX_BUFS];
+    uint32_t num_bufs;
 } WCN7850RingState;
 
 /* QRTR protocol constants */
@@ -2982,6 +2989,7 @@ static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
                 r->hp_shadow_addr = hp_addr;
                 r->tp_shadow_addr = tp_addr;
                 r->enable = true;
+                r->num_bufs = 0;
                 qemu_log("WCN: HTT SRING_SETUP ring_type=%u ring_id=%u pdev=%u"
                          " base=0x%"PRIx64" sz=%u esz=%u hp=0x%"PRIx64" tp=0x%"PRIx64"\n",
                          htt_ring_type, htt_ring_id, pdev_id,
@@ -4700,6 +4708,105 @@ static void wcn7850_pend_timer(void *opaque)
     s->pend_len = 0;
 }
 
+/* Poll RXDMA buf rings: read driver-posted HP, consume new buffer
+ * descriptors (8-byte DMA addresses), and add them to the free list. */
+static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
+{
+    for (int i = 0; i < s->num_rings; i++) {
+        WCN7850RingState *r = &s->rings[i];
+        if (!r->configured || !r->enable || r->type != WCN7850_RING_RXDMA_BUF) {
+            continue;
+        }
+        if (!r->hp_shadow_addr || !r->base_addr) {
+            continue;
+        }
+
+        /* Read the current HP from the driver's shadow write-index */
+        uint32_t hp_le = 0;
+        if (pci_dma_read(pci_dev, r->hp_shadow_addr, &hp_le, 4) != MEMTX_OK) {
+            continue;
+        }
+        uint32_t hp_val = le32_to_cpu(hp_le);
+        /* HP may be in entries (divide by entry_size) or bytes; treat byte
+         * offsets consistently.  The HAL stores HP in bytes when operating
+         * in byte-mode (entry_size is always 8 for RXDMA buf rings). */
+        uint32_t hp = hp_val;
+        uint32_t tp = r->tp;
+        uint32_t esize = r->entry_size ?: 8;
+        uint32_t ring_bytes = r->size ?: (4096 * esize);
+
+        if (hp == tp) {
+            continue;
+        }
+
+        /* Number of new entries = (hp - tp) / esize, handling wrap */
+        int32_t diff;
+        if (hp >= tp) {
+            diff = hp - tp;
+        } else {
+            diff = (ring_bytes - tp) + hp;
+        }
+        int num_entries = diff / (int)esize;
+        if (num_entries <= 0) {
+            continue;
+        }
+
+        /* Cap to available space in our tracking array */
+        if (num_entries > WCN7850_RXDMA_MAX_BUFS - (int)r->num_bufs) {
+            num_entries = WCN7850_RXDMA_MAX_BUFS - (int)r->num_bufs;
+        }
+        if (num_entries <= 0) {
+            continue;
+        }
+
+        qemu_log("WCN: RXDMA buf ring %d HP=%u TP=%u entries=%d (0x%"PRIx64" sz=%u esz=%u)\n",
+                 r->ring_id, hp, tp, num_entries, r->base_addr, r->size, esize);
+
+        int consumed = 0;
+        for (int j = 0; j < num_entries; j++) {
+            uint64_t desc_addr = r->base_addr + tp;
+            uint8_t desc[8];
+            if (pci_dma_read(pci_dev, desc_addr, desc, esize > 8 ? 8 : esize) != MEMTX_OK) {
+                break;
+            }
+            uint64_t buf_addr;
+            if (esize >= 8) {
+                uint32_t lo = le32_to_cpu(*(uint32_t *)desc);
+                uint32_t hi = le32_to_cpu(*(uint32_t *)(desc + 4));
+                buf_addr = ((uint64_t)hi << 32) | lo;
+                /* Mask off cookie/high bits — the upper 16 bits of info1
+                 * are SW cookie/pdev_id for buffer tracking. */
+                buf_addr &= 0xffffffffffULL;
+            } else if (esize == 4) {
+                buf_addr = le32_to_cpu(*(uint32_t *)desc);
+            } else {
+                buf_addr = 0;
+            }
+
+            if (buf_addr) {
+                r->buf_addrs[r->num_bufs++] = buf_addr;
+                qemu_log("WCN: RXDMA buf ring %d posted buf_addr=0x%"PRIx64" (total %u)\n",
+                         r->ring_id, buf_addr, r->num_bufs);
+            }
+
+            tp += esize;
+            if (tp >= ring_bytes) {
+                tp = 0;
+            }
+            consumed++;
+        }
+
+        /* Update TP and write back to shadow so driver sees consumption */
+        if (consumed > 0) {
+            r->tp = tp;
+            uint32_t tp_le = cpu_to_le32(tp);
+            if (r->tp_shadow_addr) {
+                pci_dma_write(pci_dev, r->tp_shadow_addr, &tp_le, sizeof(tp_le));
+            }
+        }
+    }
+}
+
 /* CE poll timer: scan CE source rings for new descriptors from driver.
  * Also retries NEW_SERVER when the host (qrtr_mhi) posts DL receive buffers. */
 static void wcn7850_ce_poll_timer(void *opaque)
@@ -4785,6 +4892,9 @@ static void wcn7850_ce_poll_timer(void *opaque)
             wcn7850_process_ce_src(s, pci_dev, i);
         }
     }
+
+    /* Scan RXDMA buf rings for driver-posted RX buffer addresses */
+    wcn7850_poll_rxdma_buf_rings(s, pci_dev);
 
 reschedule:
     timer_mod(s->ce_poll_timer,

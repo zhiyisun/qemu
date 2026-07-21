@@ -224,14 +224,14 @@ typedef struct {
 
 /* Additional WMI command/event IDs used by the STA connect path.
  * (event groups use WMI_EVT_GRP_START_ID(grp) = ((grp)<<12)|0x1) */
-#define WMI_START_SCAN_CMDID       WMI_TLV_CMD(WMI_GRP_SCAN)        /* 0x1001 */
-#define WMI_SCAN_CHAN_LIST_CMDID   (WMI_TLV_CMD(WMI_GRP_SCAN) + 2)  /* 0x1003 */
+#define WMI_START_SCAN_CMDID       WMI_TLV_CMD(WMI_GRP_SCAN)        /* 0x3001 */
+#define WMI_SCAN_CHAN_LIST_CMDID   (WMI_TLV_CMD(WMI_GRP_SCAN) + 2)  /* 0x3003 */
 #define WMI_VDEV_START_REQUEST_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
 #define WMI_VDEV_UP_CMDID          (WMI_TLV_CMD(WMI_GRP_VDEV) + 4)  /* 0x5005 */
 #define WMI_PEER_ASSOC_CMDID       (WMI_TLV_CMD(WMI_GRP_PEER) + 4)  /* 0x6005 */
 #define WMI_VDEV_INSTALL_KEY_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 8)   /* 0x5009 */
 
-#define WMI_SCAN_EVENTID           WMI_EVT_GRP_START_ID(WMI_GRP_SCAN)    /* 0x1001 */
+#define WMI_SCAN_EVENTID           WMI_EVT_GRP_START_ID(WMI_GRP_SCAN)    /* 0x3001 */
 #define WMI_MGMT_RX_EVENTID        WMI_EVT_GRP_START_ID(WMI_GRP_MGMT)    /* 0x7001 */
 #define WMI_MGMT_TX_SEND_CMDID     (WMI_TLV_CMD(WMI_GRP_MGMT) + 7)       /* 0x7008 */
 #define WMI_PEER_ASSOC_CONF_EVENTID (WMI_TLV_CMD(WMI_GRP_PEER) + 5)      /* 0x6006 */
@@ -241,9 +241,11 @@ typedef struct {
 #define WMI_VDEV_DELETE_RESP_EVENTID (WMI_TLV_CMD(WMI_GRP_VDEV) + 5)     /* 0x5006 */
 #define WMI_REQUEST_PDEV_STAT        BIT(2)                               /* 0x4     */
 #define WMI_REQUEST_STATS_CMDID      WMI_TLV_CMD(WMI_GRP_STATS)          /* 0x16001 */
-/* Not derivable from the group macro: the stats event enum has explicit
- * group assignments between WMI_STATS_EXT_EVENTID (0x16001) and
- * WMI_UPDATE_STATS_EVENTID, so its real value is 0x1d004 in wmi.h. */
+/* Not derivable from WMI_GRP_STATS: the WMI_UPDATE_STATS_EVENTID entry lives
+ * in the MISC group (0x1d), auto-inc from WMI_ECHO_EVENTID=0x1d001.
+ * Verified against the kernel's enum wmi_tlv_event_id in wmi.h.
+ * When bumping kernel versions, re-check all event IDs with explicit or
+ * non-contiguous values in the enum. */
 #define WMI_UPDATE_STATS_EVENTID     0x1d004
 
 /* WMI scan event types (wmi_scan_event_type) */
@@ -2338,8 +2340,9 @@ static void wcn7850_send_vdev_delete_resp(WCN7850State *s, PCIDevice *pci_dev,
 /* Build and send a WMI_UPDATE_STATS_EVENTID so the driver's
  * ath12k_mac_get_fw_stats() wait_for_completion() fires. The event carries
  * one zeroed pdev stats entry so the driver's pdev parse loop sets
- * stats->stats_id = WMI_REQUEST_PDEV_STAT, and the PDEV_STAT branch in
- * ath12k_update_stats_event unconditionally completes fw_stats_done. */
+ * stats->stats_id = PDEV_STAT and completes fw_stats_done unconditionally.
+ * The event header's stats_id is set from the request so the event type
+ * matches what was asked, even though the actual data is dummy. */
 static void wcn7850_send_stats_resp(WCN7850State *s, PCIDevice *pci_dev,
                                     uint32_t stats_id, uint32_t vdev_id,
                                     uint32_t pdev_id)
@@ -2423,7 +2426,7 @@ static void wcn7850_send_stats_resp(WCN7850State *s, PCIDevice *pci_dev,
         uint32_t num_peer_extd2_stats;
     } QEMU_PACKED sev;
     memset(&sev, 0, sizeof(sev));
-    sev.stats_id = cpu_to_le32(WMI_REQUEST_PDEV_STAT);
+    sev.stats_id = cpu_to_le32(stats_id);
     sev.num_pdev_stats = cpu_to_le32(1);
     sev.pdev_id = cpu_to_le32(pdev_id ? pdev_id : 0);
     memcpy(buf + off, &sev, sizeof(sev));

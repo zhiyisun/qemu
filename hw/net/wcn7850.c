@@ -236,12 +236,15 @@ typedef struct {
 
 /* WMI command groups */
 /* These MUST match the driver's enum wmi_cmd_group */
- #define WMI_GRP_SCAN       0x3
- #define WMI_GRP_PDEV       0x4
- #define WMI_GRP_VDEV       0x5
- #define WMI_GRP_PEER       0x6
- #define WMI_GRP_MGMT       0x7
- #define WMI_GRP_STATS      0x16
+#define WMI_GRP_SCAN       0x3
+#define WMI_GRP_PDEV       0x4
+#define WMI_GRP_VDEV       0x5
+#define WMI_GRP_PEER       0x6
+#define WMI_GRP_MGMT       0x7
+#define WMI_GRP_STA_PS     0x9
+#define WMI_GRP_DFS        0xa
+#define WMI_GRP_MISC       0x1d
+#define WMI_GRP_STATS      0x16
 
 #define WMI_TLV_CMD(grp_id) (((grp_id) << 12) | 0x1)
 #define WMI_EVT_GRP_START_ID(grp_id) (((grp_id) << 12) | 0x1)
@@ -261,7 +264,21 @@ typedef struct {
 #define WMI_VDEV_START_REQUEST_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 2) /* 0x5003 */
 #define WMI_VDEV_UP_CMDID          (WMI_TLV_CMD(WMI_GRP_VDEV) + 4)  /* 0x5005 */
 #define WMI_PEER_ASSOC_CMDID       (WMI_TLV_CMD(WMI_GRP_PEER) + 4)  /* 0x6005 */
+#define WMI_VDEV_SET_PARAM_CMDID   (WMI_TLV_CMD(WMI_GRP_VDEV) + 7)   /* 0x5008 */
 #define WMI_VDEV_INSTALL_KEY_CMDID (WMI_TLV_CMD(WMI_GRP_VDEV) + 8)   /* 0x5009 */
+
+/* STA power-save group (grp 0x9) */
+#define WMI_STA_PS_PARAM_CMDID     WMI_TLV_CMD(WMI_GRP_STA_PS)        /* 0x9001 */
+#define WMI_STA_PS_SET_STATE_CMDID (WMI_TLV_CMD(WMI_GRP_STA_PS) + 1)  /* 0x9002 */
+
+/* DFS group (grp 0xa) */
+#define WMI_DFS_ENABLE_CMDID       WMI_TLV_CMD(WMI_GRP_DFS)           /* 0xa001 */
+#define WMI_DFS_PHYERR_FILTER_ENA_CMDID (WMI_TLV_CMD(WMI_GRP_DFS) + 1) /* 0xa002 */
+#define WMI_DFS_PHYERR_FILTER_DIS_CMDID (WMI_TLV_CMD(WMI_GRP_DFS) + 2) /* 0xa003 */
+#define WMI_DFS_CMDID_0xa005       (WMI_TLV_CMD(WMI_GRP_DFS) + 4)    /* 0xa005 */
+
+/* MISC group (grp 0x1d) */
+#define WMI_LRO_CONFIG_CMDID      (WMI_TLV_CMD(WMI_GRP_MISC) + 15)   /* 0x1d010 */
 
 #define WMI_SCAN_EVENTID           WMI_EVT_GRP_START_ID(WMI_GRP_SCAN)    /* 0x3001 */
 #define WMI_MGMT_RX_EVENTID        WMI_EVT_GRP_START_ID(WMI_GRP_MGMT)    /* 0x7001 */
@@ -2234,6 +2251,7 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
     }
     const WmiCmdHdr *hdr = (const WmiCmdHdr *)payload;
     uint32_t cmd_id = le32_to_cpu(hdr->cmd_id) & 0xffffff;
+    fprintf(stderr, "WCN: WMI cmd 0x%x len=%u\n", cmd_id, len);
 
     switch (cmd_id) {
     case WMI_INIT_CMDID:
@@ -2301,6 +2319,22 @@ static void wcn7850_handle_wmi_cmd(WCN7850State *s, PCIDevice *pci_dev,
     case WMI_PDEV_SET_HW_MODE_CMDID:
         qemu_log("WCN: WMI PDEV SET HW MODE cmd\n");
         wcn7850_send_set_hw_mode_resp(s, pci_dev);
+        break;
+    case WMI_VDEV_SET_PARAM_CMDID:
+        qemu_log("WCN: WMI VDEV SET PARAM (fire-and-forget)\n");
+        break;
+    case WMI_STA_PS_PARAM_CMDID:
+    case WMI_STA_PS_SET_STATE_CMDID:
+        qemu_log("WCN: WMI STA PS cmd 0x%x (fire-and-forget)\n", cmd_id);
+        break;
+    case WMI_DFS_ENABLE_CMDID:
+    case WMI_DFS_PHYERR_FILTER_ENA_CMDID:
+    case WMI_DFS_PHYERR_FILTER_DIS_CMDID:
+    case WMI_DFS_CMDID_0xa005:
+        qemu_log("WCN: WMI DFS cmd 0x%x (fire-and-forget)\n", cmd_id);
+        break;
+    case WMI_LRO_CONFIG_CMDID:
+        qemu_log("WCN: WMI LRO CONFIG (fire-and-forget)\n");
         break;
     default:
         qemu_log("WCN: WMI cmd 0x%x len=%u (unhandled)\n", cmd_id, len);

@@ -1179,7 +1179,7 @@ static void wcn7850_update_ring_cfg(WCN7850State *s, Wcn7850RingType type, int n
     misc = *(uint32_t *)(s->bar0_always_on + misc_off);
 
     r->base_addr = ((uint64_t)(base_msb & 0xff) << 32) | base_lsb;
-    r->size = (base_msb >> 8) & 0xffff;
+    r->size = ((base_msb >> 8) & 0xfffff) * 4;
     r->entry_size = (ring_id_reg & 0xff) * 4;
     r->hp_mmio_offset = hp_off;
     r->tp_mmio_offset = tp_off;
@@ -3334,7 +3334,7 @@ static void wcn7850_handle_ce_mmio(WCN7850State *s, PCIDevice *pci_dev,
             if (base_lsb_cfg || base_msb_cfg) {
                 uint64_t base_addr = base_lsb_cfg |
                     ((uint64_t)(base_msb_cfg & 0xff) << 32);
-                uint32_t ring_sz = (base_msb_cfg >> 8) & 0xffff;
+                uint32_t ring_sz = (base_msb_cfg >> 8) & 0xfffff;
                 uint32_t entry_size = (ring_id_cfg & 0xff) * 4;
                 if (!entry_size) entry_size = 16;
                 if (!ring_sz) ring_sz = 512 * entry_size;
@@ -3379,7 +3379,7 @@ static void wcn7850_handle_ce_mmio(WCN7850State *s, PCIDevice *pci_dev,
                             cfg_base + 0x60);
                         uint32_t sts_entry_size = (sts_rind & 0xff) * 4;
                         if (!sts_entry_size) sts_entry_size = 16;
-                        s->ce_sts[ce_pipe].size = ((sts_msb >> 8) & 0xffff) * sts_entry_size;
+                        s->ce_sts[ce_pipe].size = ((sts_msb >> 8) & 0xfffff) * sts_entry_size;
                         s->ce_sts[ce_pipe].entry_size = sts_entry_size;
                         uint32_t st_hp_lsb = *(uint32_t *)(s->window_memory +
                             cfg_base + 0x6c);
@@ -4438,7 +4438,7 @@ static void wcn7850_handle_reo_r0_write(WCN7850State *s, uint32_t win_off,
                 WCN7850_RING_REO_EXCEPTION, 0);
             if (r) {
                 r->base_addr = base;
-                r->size = (*(uint32_t*)(s->window_memory + r0_base_off + 0x04) >> 8) & 0xffff;
+                r->size = ((*(uint32_t*)(s->window_memory + r0_base_off + 0x04) >> 8) & 0xfffff) * 4;
                 r->entry_size = (ring_id & 0xff) * 4;
                 r->enable = (misc & BIT(6)) != 0;
                 r->hp_shadow_addr = hp_full;
@@ -4474,7 +4474,7 @@ static void wcn7850_handle_reo_r0_write(WCN7850State *s, uint32_t win_off,
                 WCN7850_RING_REO_DST, model_ri);
             if (r) {
                 r->base_addr = base;
-                r->size = (*(uint32_t*)(s->window_memory + r0_base_off + 0x04) >> 8) & 0xffff;
+                r->size = ((*(uint32_t*)(s->window_memory + r0_base_off + 0x04) >> 8) & 0xfffff) * 4;
                 r->entry_size = (ring_id & 0xff) * 4;
                 r->enable = (misc & BIT(6)) != 0;
                 r->hp_shadow_addr = hp_full;
@@ -4523,7 +4523,7 @@ static void wcn7850_handle_tcl_window_write(WCN7850State *s,
             return;
         r->base_addr = *(uint32_t *)(s->window_memory + base) |
                        ((uint64_t)(*(uint32_t *)(s->window_memory + base + 4) & 0xff) << 32);
-        r->size = (*(uint32_t *)(s->window_memory + base + 4) >> 8) & 0xffff;
+        r->size = ((*(uint32_t *)(s->window_memory + base + 4) >> 8) & 0xfffff) * 4;
         r->entry_size = (*(uint32_t *)(s->window_memory + base + 8) & 0xff) * 4;
         r->enable = (*(uint32_t *)(s->window_memory + base + 0x10) & BIT(6)) != 0;
         r->configured = r->base_addr && r->size && r->entry_size;
@@ -4549,7 +4549,7 @@ static void wcn7850_handle_wbm_window_write(WCN7850State *s,
         if (r) {
             r->base_addr = *(uint32_t *)(s->window_memory + base) |
                 ((uint64_t)(*(uint32_t *)(s->window_memory + base + 4) & 0xff) << 32);
-            r->size = (*(uint32_t *)(s->window_memory + base + 4) >> 8) & 0xffff;
+            r->size = ((*(uint32_t *)(s->window_memory + base + 4) >> 8) & 0xfffff) * 4;
             r->entry_size = (*(uint32_t *)(s->window_memory + base + 8) & 0xff) * 4;
             r->enable = (*(uint32_t *)(s->window_memory + base + 0x10) & BIT(6)) != 0;
             r->configured = r->base_addr && r->size && r->entry_size;
@@ -4568,7 +4568,7 @@ static void wcn7850_handle_wbm_window_write(WCN7850State *s,
             if (r) {
                 r->base_addr = *(uint32_t *)(s->window_memory + base) |
                     ((uint64_t)(*(uint32_t *)(s->window_memory + base + 4) & 0xff) << 32);
-                r->size = (*(uint32_t *)(s->window_memory + base + 4) >> 8) & 0xffff;
+                r->size = ((*(uint32_t *)(s->window_memory + base + 4) >> 8) & 0xfffff) * 4;
                 r->entry_size = (*(uint32_t *)(s->window_memory + base + 8) & 0xff) * 4;
                 r->enable = (*(uint32_t *)(s->window_memory + base + 0x10) & BIT(6)) != 0;
                 uint32_t hp_lsb = *(uint32_t *)(s->window_memory + base + 0x14);

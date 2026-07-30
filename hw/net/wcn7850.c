@@ -776,6 +776,8 @@ typedef struct WCN7850State {
     uint8_t *rx_pending_buf;
     uint32_t rx_pending_len;
     bool rx_pending;
+    uint64_t rx_count;
+    uint64_t rx_ipv4_count;
 
     /* TX packet processing */
     uint8_t *tx_buffer;
@@ -1268,11 +1270,7 @@ static ssize_t wcn7850_nc_receive_iov(NetClientState *nc, const struct iovec *io
     }
     s->rx_pending = true;
 
-    fprintf(stderr, "WCN: Queued RX pkt len=%zu from netdev (nc=%p peer=%p)\n",
-            total, (void *)nc, (void *)qemu_get_queue(s->nic)->peer);
-    /* Also emit qemu_log so the message appears in -D log output as well */
-    qemu_log("WCN: Queued RX pkt len=%zu from netdev nc=%p peer=%p\n",
-             total, (void *)nc, (void *)qemu_get_queue(s->nic)->peer);
+    s->rx_count++;
     return total;
 }
 
@@ -1312,6 +1310,11 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
     uint32_t tp = tcl->tp;
     uint32_t hp = tcl->hp;
     uint32_t ring_size = tcl->size ?: (512 * entry_size);
+    static const int tcl_to_wbm[] = { 0, 2, 4 };
+    int wbm_idx = (tcl->ring_id < 3) ? tcl_to_wbm[tcl->ring_id] : 0;
+    int processed = 0;
+    int wbm_posted = 0;
+    WCN7850RingState *wbm_ring = NULL;
 
     if (tp > ring_size || hp > ring_size) {
         return;
@@ -1327,10 +1330,9 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
         return;
     }
 
-    fprintf(stderr, "WCN: TX TCL ring %u tp=%u hp=%u entries=%u\n",
-            tcl->ring_id, tp, hp, entries);
+    if (entries > 64) entries = 64;
 
-    for (i = 0; i < entries && i < 64; i++) {
+    for (i = 0; i < entries; i++) {
         uint64_t desc_addr = tcl->base_addr + tp;
         uint8_t desc[32];
         uint64_t buf_addr;
@@ -1338,21 +1340,15 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
         uint32_t tcl_info1;
 
         if (pci_dma_read(pci_dev, desc_addr, desc, sizeof(desc)) != MEMTX_OK) {
-            fprintf(stderr, "WCN: TX desc dma read FAILED at addr=0x%lx\n",
-                    (unsigned long)desc_addr);
             break;
         }
 
-        /* TCL uses ath12k_buffer_addr: info1 contains address bits 39:32,
-         * RBM, and the software cookie. Do not treat the whole pair as a
-         * little-endian 64-bit address. */
         buf_addr = (uint64_t)le32_to_cpu(*(uint32_t *)desc) |
                    ((uint64_t)(le32_to_cpu(*(uint32_t *)(desc + 4)) & 0xff) << 32);
         buf_len = le32_to_cpu(*(uint32_t *)(desc + 16)) & 0x3fff;
         tcl_info1 = le32_to_cpu(*(uint32_t *)(desc + 4));
 
         if (!buf_addr || !buf_len) {
-            /* Empty descriptor (driver has retired it); skip. */
             tp += entry_size;
             if (tp >= ring_size) tp = 0;
             continue;
@@ -1364,38 +1360,12 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
             s->tx_buffer = g_malloc(65536);
         }
 
-        /* Ethernet-offload descriptors point directly at the Ethernet frame;
-         * pkt_offset is used by native-Wi-Fi encapsulation only. */
         if (pci_dma_read(pci_dev, buf_addr, s->tx_buffer,
                          buf_len) != MEMTX_OK) {
             tp += entry_size;
             if (tp >= ring_size) tp = 0;
             continue;
         }
-
-        fprintf(stderr, "WCN: TX pkt len=%u buf=0x%lx\n",
-                buf_len, (unsigned long)buf_addr);
-        if (buf_len >= 14)
-            fprintf(stderr, "WCN: TX ethertype=0x%02x%02x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                    s->tx_buffer[12], s->tx_buffer[13],
-                    s->tx_buffer[0], s->tx_buffer[1], s->tx_buffer[2],
-                    s->tx_buffer[3], s->tx_buffer[4], s->tx_buffer[5],
-                    s->tx_buffer[6], s->tx_buffer[7], s->tx_buffer[8],
-                    s->tx_buffer[9], s->tx_buffer[10], s->tx_buffer[11]);
-        if (buf_len >= 34 && s->tx_buffer[12] == 0x08 &&
-            s->tx_buffer[13] == 0x00)
-            fprintf(stderr, "WCN: TX IPv4 proto=%u src=%u.%u.%u.%u dst=%u.%u.%u.%u\n",
-                    s->tx_buffer[23], s->tx_buffer[26], s->tx_buffer[27],
-                    s->tx_buffer[28], s->tx_buffer[29], s->tx_buffer[30],
-                    s->tx_buffer[31], s->tx_buffer[32], s->tx_buffer[33]);
-        if (buf_len >= 32)
-            fprintf(stderr, "WCN: TX raw=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                    s->tx_buffer[0], s->tx_buffer[1], s->tx_buffer[2], s->tx_buffer[3],
-                    s->tx_buffer[4], s->tx_buffer[5], s->tx_buffer[6], s->tx_buffer[7],
-                    s->tx_buffer[8], s->tx_buffer[9], s->tx_buffer[10], s->tx_buffer[11],
-                    s->tx_buffer[12], s->tx_buffer[13], s->tx_buffer[14], s->tx_buffer[15],
-                    s->tx_buffer[16], s->tx_buffer[17], s->tx_buffer[18], s->tx_buffer[19],
-                    s->tx_buffer[20], s->tx_buffer[21], s->tx_buffer[22], s->tx_buffer[23]);
 
         if (s->nic) {
             NetClientState *nc = qemu_get_queue(s->nic);
@@ -1404,12 +1374,6 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
                 size_t ethernet_len = buf_len;
                 const uint8_t *frame = s->tx_buffer;
 
-                if (buf_len >= 14 && s->tx_buffer[12] == 0x08 &&
-                    s->tx_buffer[13] == 0x00)
-                    fprintf(stderr, "WCN: TX direct IPv4 frame\n");
-
-                /* Native-Wi-Fi TX carries an 802.11 data header and LLC/SNAP;
-                 * slirp expects the Ethernet frame after decapsulation. */
                 if (buf_len >= 32 &&
                     (le16_to_cpu(*(uint16_t *)frame) & 0x000c) == 0x0008) {
                     size_t hdr_len = 24;
@@ -1428,74 +1392,66 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
                         frame = ethernet;
                     }
                 }
-                fprintf(stderr, "WCN: TX send len=%zu\n", ethernet_len);
                 qemu_send_packet(nc, frame, ethernet_len);
-            } else {
-                fprintf(stderr, "WCN: TX no peer\n");
             }
-        } else {
-            fprintf(stderr, "WCN: TX no nic\n");
         }
 
         /* Post TX completion to the WBM2SW release ring */
         {
-            static const int tcl_to_wbm[] = { 0, 2, 4 };
-            int wbm_idx = (tcl->ring_id < 3) ? tcl_to_wbm[tcl->ring_id] : 0;
             WCN7850RingState *wbm = wcn7850_find_ring(s,
                 WCN7850_RING_WBM2SW_RELEASE, wbm_idx);
-            if (wbm && wbm->configured && wbm->enable && wbm->entry_size >= 32) {
-                uint32_t wbm_hp = wbm->hp;
-                uint32_t wbm_tp = wbm->tp;
-                uint32_t wbm_sz = wbm->size ?: (512 * wbm->entry_size);
-                uint32_t next_hp = wbm_hp + wbm->entry_size;
-                if (next_hp >= wbm_sz) next_hp = 0;
-
-                if (next_hp != wbm_tp) {
+            if (wbm) {
+                uint32_t esize = wbm->entry_size;
+                uint32_t whp = wbm->hp;
+                uint32_t wtp = wbm->tp;
+                uint32_t wsz = wbm->size;
+                uint32_t next = whp + esize;
+                if (next >= wsz) next = 0;
+                if (next != wtp) {
                     uint8_t comp[32] = {0};
                     uint32_t *comp32 = (uint32_t *)comp;
-                    /* buf_addr_info.info0 = 0 (not used for SW cookie path) */
                     comp32[0] = 0;
-                    /* buf_addr_info.info1 = captured TCL info1 (SW cookie in bits 31:12) */
                     comp32[1] = cpu_to_le32(tcl_info1);
-                    /* info0: REL_SRC_MODULE=TQM(0), DESC_TYPE=REL_MSDU(0),
-                     * TQM_RELEASE_REASON=FRAME_ACKED(0), CC_DONE=0 (SW path) */
                     comp32[2] = 0;
-                    /* info1: TRANSMIT_COUNT = 1 */
                     comp32[3] = cpu_to_le32(1u << 24);
-                    /* info2: FIRST_MSDU | LAST_MSDU */
                     comp32[4] = cpu_to_le32((1u << 8) | (1u << 9));
-                    /* info3..5 = 0 (maps to rate_stats.info0, tsf, info3 in
-                     * hal_wbm_completion_ring_tx) */
                     comp32[5] = 0;
                     comp32[6] = 0;
                     comp32[7] = 0;
-
-                    if (pci_dma_write(pci_dev, wbm->base_addr + wbm_hp,
+                    if (pci_dma_write(pci_dev, wbm->base_addr + whp,
                                       comp, sizeof(comp)) == MEMTX_OK) {
-                        wbm->hp = next_hp;
-                        uint32_t hp_le = cpu_to_le32(next_hp);
-                        if (wbm->hp_shadow_addr) {
-                            pci_dma_write(pci_dev, wbm->hp_shadow_addr, &hp_le, sizeof(hp_le));
-                        }
-                        *(uint32_t *)(s->bar0_always_on + wbm->hp_mmio_offset) = next_hp;
-                        fprintf(stderr, "WCN: TX WBM completion ring=%d hp=%u\n",
-                                wbm->ring_id, next_hp);
-                        if (wbm->msivec < WCN7850_MSI_VECTORS) {
-                            msi_notify(pci_dev, wbm->msivec);
-                        }
-                    } else {
-                        fprintf(stderr, "WCN: TX WBM dma write FAILED\n");
+                        wbm->hp = next;
+                        wbm_posted++;
+                        wbm_ring = wbm;
                     }
                 }
             }
         }
 
+        processed++;
         tp += entry_size;
         if (tp >= ring_size) tp = 0;
     }
 
+    /* Flush WBM HP once for the whole batch */
+    if (wbm_posted > 0 && wbm_ring) {
+        uint32_t hp_le = cpu_to_le32(wbm_ring->hp);
+        if (wbm_ring->hp_shadow_addr) {
+            pci_dma_write(pci_dev, wbm_ring->hp_shadow_addr, &hp_le, sizeof(hp_le));
+        }
+        *(uint32_t *)(s->bar0_always_on + wbm_ring->hp_mmio_offset) = wbm_ring->hp;
+        if (wbm_ring->msivec < WCN7850_MSI_VECTORS) {
+            msi_notify(pci_dev, wbm_ring->msivec);
+        }
+    }
+
     tcl->tp = tp;
     *(uint32_t *)(s->bar0_always_on + tcl->tp_mmio_offset) = tp;
+
+    if (processed > 0) {
+        fprintf(stderr, "WCN: TX ring=%u processed=%u wbm=%u\n",
+                tcl->ring_id, processed, wbm_posted);
+    }
 }
 
 /* ===== CE/HTC/WMI handler ===== */
@@ -4913,8 +4869,6 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
                 WCN7850RingState *r = wcn7850_find_ring(s, WCN7850_RING_WBM2SW_RELEASE, wbm_idx);
                 if (r) {
                     r->tp = (uint32_t)val * 4;
-                    fprintf(stderr, "WCN: WBM2SW_RELEASE ring %d TP sidx=%u val=0x%x tp=%u\n",
-                            wbm_idx, sidx, (uint32_t)val, r->tp);
                 }
                 return;
             }
@@ -5415,12 +5369,9 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
             continue;
         }
         if (!r->hp_shadow_addr || !r->base_addr) {
-            qemu_log("WCN: Poll rxdma ring %d (id=%u) has no hp_shadow or base\n",
-                     i, r->ring_id);
             continue;
         }
 
-        /* Read the current HP from the driver's shadow write-index */
         uint32_t hp_le = 0;
         if (pci_dma_read(pci_dev, r->hp_shadow_addr, &hp_le, 4) != MEMTX_OK) {
             continue;
@@ -5455,9 +5406,6 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
             continue;
         }
 
-        qemu_log("WCN: RXDMA buf ring %d HP=%u TP=%u entries=%d (total bufs %u)\n",
-                 r->ring_id, hp, tp, num_entries, r->num_bufs);
-
         int consumed = 0;
         for (int j = 0; j < num_entries; j++) {
             uint64_t desc_addr = r->base_addr + tp;
@@ -5481,14 +5429,6 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
             if (buf_addr && buf_cookie) {
                 r->buf_addrs[r->num_bufs++] = buf_addr;
                 r->buf_cookies[r->num_bufs - 1] = buf_cookie;
-                if ((r->num_bufs % 64) == 0) {
-                    qemu_log("WCN: RXDMA buf ring %d posted total %u (last=0x%"PRIx64")\n",
-                             r->ring_id, r->num_bufs, buf_addr);
-                }
-                if (r->ring_id == 0 && r->num_bufs <= 64) {
-                    qemu_log("WCN: Initial poll ring0 entry %u buf=0x%"PRIx64" cookie=0x%x\n",
-                             r->num_bufs, buf_addr, buf_cookie);
-                }
             }
 
             tp += esize;
@@ -5516,8 +5456,6 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
     
     if (ring0 && ring1 && ring2 && ring0->num_bufs > 0 &&
         (ring1->num_bufs < WCN7850_RXDMA_MAX_BUFS || ring2->num_bufs < WCN7850_RXDMA_MAX_BUFS)) {
-        qemu_log("WCN: Distributing %u buffers from ring 0 to rings 1/2\n", ring0->num_bufs);
-        
         for (int j = 0; j < (int)ring0->num_bufs && (ring1->num_bufs < WCN7850_RXDMA_MAX_BUFS || ring2->num_bufs < WCN7850_RXDMA_MAX_BUFS); j++) {
             uint64_t buf_addr = ring0->buf_addrs[j];
             
@@ -5556,39 +5494,15 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
         }
         
         if (selected_ring && selected_idx >= 0) {
-            /* Get a buffer address from the ring */
             uint64_t buf_addr = selected_ring->buf_addrs[selected_ring->num_bufs - 1];
             uint32_t buf_cookie = selected_ring->buf_cookies[selected_ring->num_bufs - 1];
-            qemu_log("WCN: RX buffer available at 0x%"PRIx64"\n", buf_addr);
 
-            /* Debug: record rx_pending state before selecting packet source */
-            fprintf(stderr, "WCN: inject: ring=%d num_bufs=%u s->rx_pending=%d rx_pending_len=%u rx_pending_buf=%p nic=%p peer=%p\n",
-                    selected_idx, selected_ring ? selected_ring->num_bufs : 0,
-                    s->rx_pending, s->rx_pending_len, (void *)s->rx_pending_buf,
-                    (void *)s->nic,
-                    (void *)(s->nic ? qemu_get_queue(s->nic)->peer : NULL));
-            qemu_log("WCN: inject: ring=%d num_bufs=%u s->rx_pending=%d rx_pending_len=%u rx_pending_buf=%p nic=%p peer=%p\n",
-                     selected_idx, selected_ring ? selected_ring->num_bufs : 0,
-                     s->rx_pending, s->rx_pending_len, (void *)s->rx_pending_buf,
-                     (void *)s->nic,
-                     (void *)(s->nic ? qemu_get_queue(s->nic)->peer : NULL));
-
-            /* Determine packet source: prefer real netdev packet, fall back to fake ARP */
             uint8_t *pkt_data = NULL;
             size_t pkt_len = 0;
 
             if (s->rx_pending && s->rx_pending_buf && s->rx_pending_len > 0) {
                 pkt_data = s->rx_pending_buf;
                 pkt_len = s->rx_pending_len;
-                /* Log to both stderr and QEMU log to make debugging easier */
-                fprintf(stderr, "WCN: Using real netdev packet len=%zu rx_pending=%d buf=%p nic=%p peer=%p\n",
-                        pkt_len, s->rx_pending, (void *)s->rx_pending_buf,
-                        (void *)s->nic,
-                        (void *)(s->nic ? qemu_get_queue(s->nic)->peer : NULL));
-                qemu_log("WCN: Using real netdev packet len=%zu rx_pending=%d buf=%p nic=%p peer=%p\n",
-                         pkt_len, s->rx_pending, (void *)s->rx_pending_buf,
-                         (void *)s->nic,
-                         (void *)(s->nic ? qemu_get_queue(s->nic)->peer : NULL));
             } else {
                 g_assert_not_reached();
             }
@@ -5626,41 +5540,21 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
               memcpy(rx_buf + 218, pkt_data + 6, 6);
               memcpy(rx_buf + 224, pkt_data, 6);
               memcpy(rx_buf + 148, &mpdu_start_tag, sizeof(mpdu_start_tag));
-             memcpy(rx_buf + rx_payload_offset, pkt_data, copy_size);
-             if (copy_size >= 14 && pkt_data[12] == 0x08 && pkt_data[13] == 0x00)
-                 qemu_log("WCN: RX IPv4 payload dst=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                          pkt_data[0], pkt_data[1], pkt_data[2], pkt_data[3],
-                          pkt_data[4], pkt_data[5]);
-            qemu_log("WCN: RX frame ethertype=0x%02x%02x dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x\n",
-                     pkt_data[12], pkt_data[13],
-                     pkt_data[0], pkt_data[1], pkt_data[2], pkt_data[3], pkt_data[4], pkt_data[5],
-                     pkt_data[6], pkt_data[7], pkt_data[8], pkt_data[9], pkt_data[10], pkt_data[11]);
-             if (copy_size >= 42 && pkt_data[12] == 0x08 && pkt_data[13] == 0x06) {
-                qemu_log("WCN: ARP op=%02x%02x spa=%02x.%02x.%02x.%02x tpa=%02x.%02x.%02x.%02x\n",
-                         pkt_data[20], pkt_data[21],
-                         pkt_data[28], pkt_data[29], pkt_data[30], pkt_data[31],
-                         pkt_data[38], pkt_data[39], pkt_data[40], pkt_data[41]);
-             }
-              (void)0;
+              memcpy(rx_buf + rx_payload_offset, pkt_data, copy_size);
+            if (copy_size >= 14 && pkt_data[12] == 0x08 && pkt_data[13] == 0x00)
+                s->rx_ipv4_count++;
             if ((uintptr_t)buf_addr >= WCN7850_POOL_PADDR &&
                 (uintptr_t)buf_addr < WCN7850_POOL_PADDR + WCN7850_POOL_SIZE) {
                 uintptr_t pool_offset = buf_addr - WCN7850_POOL_PADDR;
                  memcpy(s->pool_mem + pool_offset, rx_buf, rx_payload_offset + copy_size);
              } else if (pci_dma_write(pci_dev, buf_addr, rx_buf,
                                       rx_payload_offset + copy_size) != MEMTX_OK) {
-                 qemu_log("WCN: RX packet DMA write failed at 0x%"PRIx64" len=%zu\n",
-                          buf_addr, rx_payload_offset + copy_size);
+                  qemu_log("WCN: RX packet DMA write failed at 0x%"PRIx64" len=%zu\n",
+                           buf_addr, rx_payload_offset + copy_size);
              }
-             fprintf(stderr, "WCN: RX packet written to buffer at 0x%"PRIx64" len=%zu\n",
-                     buf_addr, rx_payload_offset + copy_size);
-             qemu_log("WCN: RX packet written to buffer at 0x%"PRIx64" len=%zu\n",
-                      buf_addr, rx_payload_offset + copy_size);
-            g_free(rx_buf);
+             g_free(rx_buf);
 
-            /* Clean up real packet if used */
             if (s->rx_pending) {
-                fprintf(stderr, "WCN: clearing rx_pending buf=%p len=%u\n",
-                        (void *)s->rx_pending_buf, s->rx_pending_len);
                 qemu_log("WCN: clearing rx_pending buf=%p len=%u\n",
                          (void *)s->rx_pending_buf, s->rx_pending_len);
                 g_free(s->rx_pending_buf);
@@ -5694,7 +5588,6 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
                                  &tp_le, sizeof(tp_le)) == MEMTX_OK) {
                     reo_dst->tp = le32_to_cpu(tp_le);
                 }
-                qemu_log("WCN: Posting RX completion to REO destination ring\n");
                 
                 uint32_t esize = reo_dst->entry_size ?: 32; /* REO DST entries are 32 bytes */
                 
@@ -5722,11 +5615,6 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
                  * descriptor would make ath12k interpret packet bytes as a
                  * link descriptor and lose the buffer cookie. */
                 entry[7] = cpu_to_le32(1 << 1);
-                qemu_log("WCN: REO entry words=%08x %08x %08x %08x %08x %08x %08x %08x\n",
-                         le32_to_cpu(entry[0]), le32_to_cpu(entry[1]),
-                         le32_to_cpu(entry[2]), le32_to_cpu(entry[3]),
-                         le32_to_cpu(entry[4]), le32_to_cpu(entry[5]),
-                         le32_to_cpu(entry[6]), le32_to_cpu(entry[7]));
                 
                 /* Write entry at current HP (producer position for DST ring) */
                 uint64_t write_addr = reo_dst->base_addr + reo_dst->hp;
@@ -5866,7 +5754,6 @@ static void wcn7850_ce_poll_timer(void *opaque)
         uint32_t hp_window;
         uint32_t hp_shadow;
         uint32_t hp_direct;
-        uint32_t probe[6] = { 0 };
 
         if (!tcl || !tcl->configured || !tcl->enable)
             continue;
@@ -5881,20 +5768,17 @@ static void wcn7850_ce_poll_timer(void *opaque)
         hp_direct = le32_to_cpu(hp_direct) * 4;
         uint32_t hp = hp_window != tcl->hp ? hp_window :
                       (hp_direct != tcl->hp ? hp_direct : hp_shadow);
-        if (hp == tcl->hp &&
-            pci_dma_read(pci_dev, tcl->base_addr + tcl->tp,
-                         probe, sizeof(probe)) == MEMTX_OK &&
-            le32_to_cpu(probe[0]) != 0 &&
-            (le32_to_cpu(probe[4]) & 0x3fff) != 0) {
-            hp = tcl->tp + tcl->entry_size;
-            if (hp >= tcl->size)
-                hp = 0;
-            fprintf(stderr, "WCN: TCL descriptor probe ring=%d tp=%u hp=%u\n",
-                    i, tcl->tp, hp);
+        if (hp == tcl->hp) {
+            uint32_t probe[2];
+            if (pci_dma_read(pci_dev, tcl->base_addr + tcl->tp,
+                             probe, sizeof(probe)) == MEMTX_OK &&
+                le32_to_cpu(probe[0]) != 0) {
+                hp = tcl->tp + tcl->entry_size;
+                if (hp >= tcl->size)
+                    hp = 0;
+            }
         }
         if (hp != tcl->hp) {
-            fprintf(stderr, "WCN: TCL HP poll ring=%d hp=%u old=%u window=%u direct=%u shadow=%u\n",
-                    i, hp, tcl->hp, hp_window, hp_direct, hp_shadow);
             tcl->hp = hp;
             wcn7850_process_tcl_data(s, pci_dev, tcl);
         }

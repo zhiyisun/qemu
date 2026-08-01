@@ -520,6 +520,9 @@ typedef struct {
     uint32_t dword1;
 } QEMU_PACKED MhiTre;
 
+#define WCN7850_MHI_SPECIAL_BASE 0x1e0e100
+#define WCN7850_MAX_MHI_RING_SIZE (256 * sizeof(MhiTre))
+
 /* QRTR v1 header (32 bytes) */
 typedef struct {
     uint32_t version;
@@ -3446,7 +3449,9 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
     uint32_t hp = s->ce_src[ce_pipe].hp;
     bool consumed = false;
 
-    if (!base || !ring_sz)
+    if (!base || !ring_sz || esize < sizeof(uint64_t) ||
+        esize > WCN7850_MAX_CE_DESC_SIZE || ring_sz < esize ||
+        ring_sz % esize)
         return;
 
     if (tp != hp)
@@ -3489,6 +3494,11 @@ static void wcn7850_process_ce_src(WCN7850State *s, PCIDevice *pci_dev,
         }
 
         /* Parse HTC header */
+        if (buf_len < sizeof(HtcHdr)) {
+            tp += esize;
+            if (tp >= ring_sz) tp = 0;
+            continue;
+        }
         HtcHdr *htc_hdr = (HtcHdr *)htc_buf;
         uint8_t epid = HTC_HDR_EPID(htc_hdr);
         uint32_t payload_len = HTC_HDR_PAYLOAD_LEN(htc_hdr);
@@ -4095,6 +4105,9 @@ static void wcn7850_process_qrtr(WCN7850State *s, PCIDevice *pci_dev,
     (void)src_node;
     (void)src_port;
 
+    if (payload_size > data_len - sizeof(*hdr))
+        return;
+
     /* If host asks us to confirm receipt, send RESUME_TX to unblock flow */
     if (confirm_rx) {
         WCN_DBG(s, "WCN: QRTR confirm_rx -> send RESUME_TX\n");
@@ -4109,9 +4122,6 @@ static void wcn7850_process_qrtr(WCN7850State *s, PCIDevice *pci_dev,
             WCN_DBG(s, " %02x", payload[_i]);
         WCN_DBG(s, "\n");
     }
-
-    if (payload_size + sizeof(*hdr) > data_len)
-        return;
 
     switch (type) {
     case QRTR_TYPE_DATA:
@@ -4204,6 +4214,10 @@ static void wcn7850_process_ul_data(WCN7850State *s, PCIDevice *pci_dev,
     if (!wcn7850_read_chan_ctxt(pci_dev, ch_ctxt_addr, &ctxt))
         return;
     if (!ctxt.rbase || !ctxt.rlen)
+        return;
+    if (ctxt.rlen > WCN7850_MAX_MHI_RING_SIZE ||
+        ctxt.rlen % sizeof(MhiTre) ||
+        ctxt.rbase + ctxt.rlen < ctxt.rbase)
         return;
 
     if (ctxt.rp < ctxt.rbase || ctxt.rp >= ctxt.rbase + ctxt.rlen)
@@ -4384,6 +4398,9 @@ static void wcn7850_emit_ee_event(WCN7850State *s, PCIDevice *pci_dev)
 
     if (!rbase || !rlen)
         return;
+    if (rlen > WCN7850_MAX_MHI_RING_SIZE ||
+        rlen % sizeof(MhiTre) || rbase + rlen < rbase)
+        return;
 
     if (rp < rbase || rp >= rbase + rlen)
         rp = rbase;
@@ -4459,6 +4476,11 @@ static uint64_t wcn7850_mmio_read(void *opaque, hwaddr addr, unsigned size)
     WCN7850State *s = opaque;
     uint64_t ret = 0;
     hwaddr win_off;
+
+    if (addr >= WCN7850_MHI_SPECIAL_BASE &&
+        addr < WCN7850_MHI_SPECIAL_BASE + WCN7850_MHIREGLEN) {
+        addr = WCN7850_MHIREGLEN + (addr - WCN7850_MHI_SPECIAL_BASE);
+    }
 
     switch (addr) {
     case WCN7850_MHIREGLEN:
@@ -4733,6 +4755,11 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
 {
     WCN7850State *s = opaque;
     PCIDevice *pci_dev = PCI_DEVICE(s);
+
+    if (addr >= WCN7850_MHI_SPECIAL_BASE &&
+        addr < WCN7850_MHI_SPECIAL_BASE + WCN7850_MHIREGLEN) {
+        addr = WCN7850_MHIREGLEN + (addr - WCN7850_MHI_SPECIAL_BASE);
+    }
     if (addr >= WCN7850_SHADOW_BASE &&
         addr < WCN7850_SHADOW_BASE + WCN7850_SHADOW_MAX * 4)
         WCN_DBG(s, "WCN: MMIO_WRITE addr=0x%lx val=0x%lx size=%u\n",
@@ -4764,7 +4791,7 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
         s->mhi_state = 0;
         s->bhi_downloaded = false;
         s->bhi_status = 0;
-        s->bhi_execenv = 2; /* stay in AMSS; we emulate mission mode */
+        s->bhi_execenv = 2;
         return;
     }
 
@@ -5959,12 +5986,16 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
     s->window_memory = g_malloc0(WCN7850_WINDOW_SIZE);
     pci_register_bar(pci_dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0_mmio);
 
+    if (pcie_endpoint_cap_init(pci_dev, 0x80) < 0) {
+        error_setg(errp, "failed to initialize PCIe endpoint capability");
+        return;
+    }
     if (msi_init(pci_dev, 0x50, WCN7850_MSI_VECTORS, true, false, errp) < 0)
         return;
 
 
     s->mhi_state = 0;
-    s->bhi_execenv = 2; /* MHI_EE_AMSS: skip fw load, go straight to mission mode */
+    s->bhi_execenv = 2; /* firmware shim: expose AMSS without a host image */
     s->bhi_downloaded = false;
     s->er_ctxt_addr = 0;
     s->ctrl_event_pending = false;
@@ -6182,6 +6213,37 @@ static const VMStateDescription vmstate_wcn7850 = {
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(window_select, WCN7850State),
+        VMSTATE_BOOL(bhi_downloaded, WCN7850State),
+        VMSTATE_UINT32(bhi_status, WCN7850State),
+        VMSTATE_UINT32(bhi_execenv, WCN7850State),
+        VMSTATE_UINT32(mhi_state, WCN7850State),
+        VMSTATE_UINT64(er_ctxt_addr, WCN7850State),
+        VMSTATE_BOOL(ctrl_event_pending, WCN7850State),
+        VMSTATE_UINT64(chan_ctxt_addr, WCN7850State),
+        VMSTATE_UINT64(cmd_ctxt_addr, WCN7850State),
+        VMSTATE_BOOL(qmi_service_active, WCN7850State),
+        VMSTATE_BOOL(qmi_newserver_sent, WCN7850State),
+        VMSTATE_BOOL(qmi_newserver_resent, WCN7850State),
+        VMSTATE_BOOL(qmi_boot_pending, WCN7850State),
+        VMSTATE_BOOL(qmi_newserver_delivered, WCN7850State),
+        VMSTATE_UINT16(qmi_pending_ind, WCN7850State),
+        VMSTATE_UINT32(qmi_client_node, WCN7850State),
+        VMSTATE_UINT32(qmi_client_port, WCN7850State),
+        VMSTATE_BOOL(ce_ready, WCN7850State),
+        VMSTATE_BOOL(htc_ready_sent, WCN7850State),
+        VMSTATE_BOOL(wmi_service_ready_pending, WCN7850State),
+        VMSTATE_BOOL(wmi_service_ready_sent, WCN7850State),
+        VMSTATE_BOOL(wmi_ready_sent, WCN7850State),
+        VMSTATE_UINT32(vdev_id, WCN7850State),
+        VMSTATE_BUFFER(peer_mac, WCN7850State),
+        VMSTATE_UINT16(peer_id, WCN7850State),
+        VMSTATE_BOOL(peer_mapped, WCN7850State),
+        VMSTATE_BUFFER(sta_mac, WCN7850State),
+        VMSTATE_BOOL(sta_mac_valid, WCN7850State),
+        VMSTATE_UINT32(scan_id, WCN7850State),
+        VMSTATE_UINT32(scan_vdev_id, WCN7850State),
+        VMSTATE_INT32(scan_seq_step, WCN7850State),
+        VMSTATE_BOOL(scan_seq_ap, WCN7850State),
         VMSTATE_STRUCT_ARRAY(ce_src, WCN7850State, WCN7850_CE_COUNT,
                              1, vmstate_ce_src_ring, CeSrcRing),
         VMSTATE_STRUCT_ARRAY(ce_dst, WCN7850State, WCN7850_CE_COUNT,

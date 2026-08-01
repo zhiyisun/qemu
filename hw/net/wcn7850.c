@@ -795,6 +795,17 @@ typedef struct WCN7850State {
     uint32_t pend_len;
     int pend_ce_pipe;
 
+    /* Async scan event sequence. Real firmware paces the per-channel scan
+     * events over tens of milliseconds; emitting them synchronously inside
+     * the SCAN START handler collapses that to one microsecond burst, which
+     * races the driver: the beacon (MGMT_RX) can arrive before mac80211 has
+     * switched to the scan channel, so it is silently dropped and the BSS is
+     * never recorded (flaky `iw scan`). We therefore emit each event from a
+     * timer, one per tick, ~10ms apart in guest virtual time. */
+    QEMUTimer *scan_seq_timer;
+    int scan_seq_step;  /* 0..4: STARTED/FOREIGN_CHAN/beacon/BSS_CHANNEL/COMPLETED */
+    bool scan_seq_ap;   /* whether the AP channel is part of this scan */
+
     /* ===== CE/HTC/WMI state ===== */
 
     /* CE doorbell delivery: true after QMI boot completes */
@@ -3005,20 +3016,67 @@ static void wcn7850_handle_scan_start(WCN7850State *s, PCIDevice *pci_dev,
 
     /* Scan flow the driver expects:
      *   STARTED -> (per channel) FOREIGN_CHAN + beacon (MGMT_RX) + BSS_CHANNEL
-     *   -> COMPLETED */
-    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_STARTED, 0, 0);
-    if (ap_in_scan) {
-        wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_FOREIGN_CHAN, 0,
-                                s->ap_freq);
-        /* Deliver the simulated AP beacon so mac80211 records the BSS. */
-        wcn7850_send_beacon(s, pci_dev);
-        wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_BSS_CHANNEL, 0,
-                                s->ap_freq);
-    }
-    wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_COMPLETED,
-                            WMI_SCAN_REASON_COMPLETED, 0);
-    fprintf(stderr, "WCN: scan sequence emitted for SSID '%.*s' (ap_in_scan=%d)\n",
+     *   -> COMPLETED
+     * Emit the events asynchronously via scan_seq_timer, paced ~10ms apart in
+     * guest virtual time, so the driver/mac80211 have time to process each
+     * event (STARTED -> RUNNING, FOREIGN_CHAN -> scan channel switch) before
+     * the next one arrives. In particular the beacon must follow FOREIGN_CHAN
+     * after mac80211 has set the scan channel, otherwise it is discarded. */
+    s->scan_seq_ap = ap_in_scan;
+    s->scan_seq_step = 0;
+    timer_mod(s->scan_seq_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10000);
+    fprintf(stderr, "WCN: scan sequence queued for SSID '%.*s' (ap_in_scan=%d)\n",
             s->ap_ssid_len, s->ap_ssid, ap_in_scan);
+}
+
+static void wcn7850_scan_seq_timer(void *opaque)
+{
+    WCN7850State *s = opaque;
+    PCIDevice *pci_dev = PCI_DEVICE(s);
+
+    /* If a previous event is still deferred waiting on a CE dst buffer, hold
+     * this step until it drains so the single-slot pend buffer is not
+     * overwritten. */
+    if (s->pend_len > 0) {
+        timer_mod(s->scan_seq_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000);
+        return;
+    }
+
+    switch (s->scan_seq_step) {
+    case 0:
+        wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_STARTED, 0, 0);
+        break;
+    case 1:
+        if (s->scan_seq_ap) {
+            wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_FOREIGN_CHAN, 0,
+                                    s->ap_freq);
+        }
+        break;
+    case 2:
+        if (s->scan_seq_ap) {
+            wcn7850_send_beacon(s, pci_dev);
+        }
+        break;
+    case 3:
+        if (s->scan_seq_ap) {
+            wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_BSS_CHANNEL, 0,
+                                    s->ap_freq);
+        }
+        break;
+    case 4:
+        wcn7850_send_scan_event(s, pci_dev, WMI_SCAN_EVENT_COMPLETED,
+                                WMI_SCAN_REASON_COMPLETED, 0);
+        break;
+    default:
+        s->scan_seq_step = 0;
+        return;
+    }
+
+    s->scan_seq_step++;
+    timer_mod(s->scan_seq_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10000000);
 }
 
 static void wcn7850_handle_mgmt_tx(WCN7850State *s, PCIDevice *pci_dev,
@@ -6002,6 +6060,9 @@ static void wcn7850_pci_realize(PCIDevice *pci_dev, Error **errp)
                                      wcn7850_ce_poll_timer, s);
     s->pend_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                   wcn7850_pend_timer, s);
+    s->scan_seq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     wcn7850_scan_seq_timer, s);
+    s->scan_seq_step = 0;
     s->pend_len = 0;
     timer_mod(s->ce_poll_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000000LL); /* start 1ms after realize */
@@ -6071,6 +6132,7 @@ static void wcn7850_pci_uninit(PCIDevice *pci_dev)
     timer_free(s->ctrl_event_timer);
     timer_free(s->ce_poll_timer);
     timer_free(s->pend_timer);
+    timer_free(s->scan_seq_timer);
     g_free(s->bar0_always_on);
     g_free(s->window_memory);
     g_free(s->srng_memory);

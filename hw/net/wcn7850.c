@@ -117,7 +117,7 @@ typedef struct {
 
 #define WCN7850_PENDING_RX_FRAMES 8
 typedef struct {
-    uint8_t *data;
+    uint8_t data[65535];
     uint32_t len;
 } PendingRxFrame;
 
@@ -399,7 +399,6 @@ typedef struct {
 /* Buffer pool constants */
 #define WCN7850_POOL_SIZE          (64 * 1024 * 1024)
 #define WCN7850_POOL_BUF_SIZE      2304
-#define WCN7850_POOL_NUM_BUFS      (WCN7850_POOL_SIZE / WCN7850_POOL_BUF_SIZE)
 #define WCN7850_POOL_PADDR         0x100000000ULL
 
 /* CE destination register block offsets used by the UMAC window. */
@@ -1316,7 +1315,6 @@ static ssize_t wcn7850_nc_receive_iov(NetClientState *nc, const struct iovec *io
     }
 
     uint32_t rx_idx = (s->rx_head + s->rx_count) % WCN7850_PENDING_RX_FRAMES;
-    s->rx_frames[rx_idx].data = g_malloc(total);
     s->rx_frames[rx_idx].len = total;
     size_t offset = 0;
     for (i = 0; i < iovcnt; i++) {
@@ -1640,6 +1638,14 @@ static bool wcn7850_ce_deliver(WCN7850State *s, PCIDevice *pci_dev,
     if (!base || !ring_sz) {
         return false;
     }
+    if (!s->ce_dst[ce_pipe].pending) {
+        return false;
+    }
+    uint32_t sts_esize = s->ce_sts[ce_pipe].entry_size ?: 16;
+    if (s->ce_sts[ce_pipe].base &&
+        (sts_esize < sizeof(uint32_t) || sts_esize > 4096)) {
+        return false;
+    }
 
     /* We don't reliably track the driver's posted-buffer count (the driver
      * assigns CE shadow indices dynamically), so instead of gating on a
@@ -1710,16 +1716,16 @@ static bool wcn7850_ce_deliver(WCN7850State *s, PCIDevice *pci_dev,
 
     /* Write CE dst status descriptor and advance STATUS HP */
     if (s->ce_sts[ce_pipe].base) {
-        uint32_t sts_esize = s->ce_sts[ce_pipe].entry_size ?: 16;
         uint32_t sts_hp = s->ce_sts[ce_pipe].hp;
-        uint8_t sts_desc[16] = {0};
+        uint8_t *sts_desc;
+        sts_desc = g_malloc0(sts_esize);
         *(uint32_t *)sts_desc = cpu_to_le32(data_len << 16);
         WCN_DBG(s, "WCN: write sts_desc pipe=%d at 0x%lx len=%u hp=%u\n",
                  ce_pipe, (unsigned long)(s->ce_sts[ce_pipe].base + sts_hp),
                  data_len, sts_hp);
         pci_dma_write(pci_dev, s->ce_sts[ce_pipe].base + sts_hp,
                       sts_desc, sts_esize);
-        {
+        if (s->dbg && sts_esize >= 16) {
             uint32_t w0, w1, w2, w3;
             pci_dma_read(pci_dev, s->ce_sts[ce_pipe].base + sts_hp, &w0, 4);
             pci_dma_read(pci_dev, s->ce_sts[ce_pipe].base + sts_hp + 4, &w1, 4);
@@ -1728,6 +1734,7 @@ static bool wcn7850_ce_deliver(WCN7850State *s, PCIDevice *pci_dev,
             WCN_DBG(s, "WCN: sts_desc written: 0x%08x 0x%08x 0x%08x 0x%08x\n",
                     w0, w1, w2, w3);
         }
+        g_free(sts_desc);
         sts_hp += sts_esize;
         if (s->ce_sts[ce_pipe].size &&
             sts_hp >= s->ce_sts[ce_pipe].size)
@@ -1746,7 +1753,7 @@ static bool wcn7850_ce_deliver(WCN7850State *s, PCIDevice *pci_dev,
                      sts_hp_words, sts_hp);
             pci_dma_write(pci_dev, s->ce_sts[ce_pipe].hp_addr,
                           &sts_hp_le, sizeof(sts_hp_le));
-            {
+            if (s->dbg) {
                 uint32_t slot, sd[8];
                 int i;
                 pci_dma_read(pci_dev, s->ce_sts[ce_pipe].hp_addr, &slot, 4);
@@ -1759,7 +1766,7 @@ static bool wcn7850_ce_deliver(WCN7850State *s, PCIDevice *pci_dev,
                 WCN_DBG(s, "WCN: CE%d status ring[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                         ce_pipe, sd[0], sd[1], sd[2], sd[3], sd[4], sd[5], sd[6], sd[7]);
             }
-            if (ce_pipe == 1) {
+            if (s->dbg && ce_pipe == 1) {
                 uint32_t s2slot, s2d[2];
                 pci_dma_read(pci_dev, s->ce_sts[2].hp_addr, &s2slot, 4);
                 pci_dma_read(pci_dev, s->ce_sts[2].base, &s2d[0], 4);
@@ -5428,20 +5435,39 @@ static void wcn7850_deferred_ce_timer(void *opaque)
     if (!s->deferred_ce_count)
         return;
     PCIDevice *pci_dev = PCI_DEVICE(s);
-    uint32_t pipe = s->deferred_ce_events[s->deferred_ce_head].pipe;
-    uint32_t event_len = s->deferred_ce_events[s->deferred_ce_head].len;
-    if (!wcn7850_ce_deliver(s, pci_dev, pipe,
-                            s->deferred_ce_events[s->deferred_ce_head].data,
-                            event_len)) {
-        timer_mod(s->deferred_ce_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000);
-        return;
+    uint32_t scanned = 0;
+    bool delivered = false;
+    while (scanned < s->deferred_ce_count) {
+        uint32_t event_idx = (s->deferred_ce_head + scanned) %
+                             WCN7850_PENDING_CE_EVENTS;
+        uint32_t pipe = s->deferred_ce_events[event_idx].pipe;
+        uint32_t event_len = s->deferred_ce_events[event_idx].len;
+        if (wcn7850_ce_deliver(s, pci_dev, pipe,
+                               s->deferred_ce_events[event_idx].data,
+                               event_len)) {
+            if (event_idx != s->deferred_ce_head) {
+                DeferredCeEvent completed = s->deferred_ce_events[event_idx];
+                for (uint32_t i = scanned; i > 0; i--) {
+                    uint32_t dst = (s->deferred_ce_head + i) %
+                                   WCN7850_PENDING_CE_EVENTS;
+                    uint32_t src = (s->deferred_ce_head + i - 1) %
+                                   WCN7850_PENDING_CE_EVENTS;
+                    s->deferred_ce_events[dst] = s->deferred_ce_events[src];
+                }
+                s->deferred_ce_events[s->deferred_ce_head] = completed;
+            }
+            s->deferred_ce_head = (s->deferred_ce_head + 1) %
+                                  WCN7850_PENDING_CE_EVENTS;
+            s->deferred_ce_count--;
+            delivered = true;
+            break;
+        }
+        scanned++;
     }
-    s->deferred_ce_head = (s->deferred_ce_head + 1) % WCN7850_PENDING_CE_EVENTS;
-    s->deferred_ce_count--;
     if (s->deferred_ce_count) {
         timer_mod(s->deferred_ce_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (delivered ? 1 : 100000));
     }
 }
 
@@ -5605,8 +5631,7 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
             uint8_t *pkt_data = NULL;
             size_t pkt_len = 0;
 
-            if (s->rx_count > 0 && s->rx_frames[s->rx_head].data &&
-                s->rx_frames[s->rx_head].len > 0) {
+            if (s->rx_count > 0 && s->rx_frames[s->rx_head].len > 0) {
                 pkt_data = s->rx_frames[s->rx_head].data;
                 pkt_len = s->rx_frames[s->rx_head].len;
             } else {
@@ -5664,8 +5689,8 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
              }
              g_free(rx_buf);
 
-            g_free(s->rx_frames[s->rx_head].data);
-            s->rx_frames[s->rx_head].data = NULL;
+            memset(s->rx_frames[s->rx_head].data, 0,
+                   sizeof(s->rx_frames[s->rx_head].data));
             s->rx_frames[s->rx_head].len = 0;
             s->rx_head = (s->rx_head + 1) % WCN7850_PENDING_RX_FRAMES;
             s->rx_count--;
@@ -6028,9 +6053,6 @@ static void wcn7850_pci_uninit(PCIDevice *pci_dev)
     timer_free(s->scan_seq_timer);
     g_free(s->bar0_always_on);
     g_free(s->window_memory);
-    for (uint32_t i = 0; i < WCN7850_PENDING_RX_FRAMES; i++) {
-        g_free(s->rx_frames[i].data);
-    }
     g_free(s->tx_buffer);
     if (s->pool_mem) {
         memory_region_del_subregion(get_system_memory(), &s->pool_mr);
@@ -6103,9 +6125,60 @@ static const VMStateDescription vmstate_deferred_ce_event = {
     }
 };
 
+static const VMStateDescription vmstate_pending_rx_frame = {
+    .name = "wcn7850/pending_rx_frame",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BUFFER(data, PendingRxFrame),
+        VMSTATE_UINT32(len, PendingRxFrame),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int wcn7850_post_load(void *opaque, int version_id)
+{
+    WCN7850State *s = opaque;
+
+    if (version_id < 2) {
+        s->rx_head = 0;
+        s->rx_count = 0;
+        memset(s->rx_frames, 0, sizeof(s->rx_frames));
+    }
+    if (s->deferred_ce_head >= WCN7850_PENDING_CE_EVENTS ||
+        s->deferred_ce_count > WCN7850_PENDING_CE_EVENTS) {
+        return -EINVAL;
+    }
+    if (s->rx_head >= WCN7850_PENDING_RX_FRAMES ||
+        s->rx_count > WCN7850_PENDING_RX_FRAMES) {
+        return -EINVAL;
+    }
+    for (uint32_t i = 0; i < WCN7850_PENDING_CE_EVENTS; i++) {
+        if (s->deferred_ce_events[i].pipe < 0 ||
+            s->deferred_ce_events[i].pipe >= WCN7850_CE_COUNT ||
+            s->deferred_ce_events[i].len > sizeof(s->deferred_ce_events[i].data)) {
+            return -EINVAL;
+        }
+    }
+    for (uint32_t i = 0; i < WCN7850_PENDING_RX_FRAMES; i++) {
+        if (s->rx_frames[i].len > sizeof(s->rx_frames[i].data)) {
+            return -EINVAL;
+        }
+    }
+    if (s->deferred_ce_count) {
+        timer_mod(s->deferred_ce_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+    }
+    if (s->rx_count) {
+        timer_mod(s->ce_poll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1);
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_wcn7850 = {
     .name = "wcn7850",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(window_select, WCN7850State),
@@ -6120,8 +6193,14 @@ static const VMStateDescription vmstate_wcn7850 = {
         VMSTATE_STRUCT_ARRAY(deferred_ce_events, WCN7850State,
                              WCN7850_PENDING_CE_EVENTS, 1,
                              vmstate_deferred_ce_event, DeferredCeEvent),
+        VMSTATE_UINT32_V(rx_head, WCN7850State, 2),
+        VMSTATE_UINT32_V(rx_count, WCN7850State, 2),
+        VMSTATE_STRUCT_ARRAY(rx_frames, WCN7850State,
+                             WCN7850_PENDING_RX_FRAMES, 2,
+                             vmstate_pending_rx_frame, PendingRxFrame),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .post_load = wcn7850_post_load,
 };
 
 static const Property wcn7850_properties[] = {

@@ -778,6 +778,7 @@ typedef struct WCN7850State {
     bool rx_pending;
     uint64_t rx_count;
     uint64_t rx_ipv4_count;
+    uint64_t rx_reject_count;
 
     /* TX packet processing */
     uint8_t *tx_buffer;
@@ -840,6 +841,8 @@ typedef struct WCN7850State {
     /* VDEV / peer assigned by the driver during connect. */
     uint32_t vdev_id;
     uint8_t peer_mac[6];      /* the AP peer MAC (== ap_bssid) */
+    uint64_t tx_dump_count;   /* TX frame dump throttle counter */
+    uint64_t tx_trace_count;  /* TX window trace throttle counter */
     uint16_t peer_id;         /* firmware-assigned peer id */
     bool peer_mapped;         /* HTT PEER_MAP v1 emitted */
     uint8_t sta_mac[6];       /* our own STA MAC (learned from mgmt TX SA) */
@@ -1208,7 +1211,12 @@ static bool wcn7850_nc_can_receive(NetClientState *nc)
     WCN7850RingState *reo = wcn7850_find_ring(s, WCN7850_RING_REO_DST, 1);
     /* RX storage is intentionally single-entry. Apply backpressure rather
      * than allowing the net backend to overwrite an unconsumed packet. */
-    return reo && reo->configured && reo->enable && !s->rx_pending;
+    bool ok = reo && reo->configured && reo->enable && !s->rx_pending;
+    if (!ok && s->rx_reject_count++ < 8)
+        qemu_log("WCN: can_receive=false rx_pending=%d reo=%d/%d\n",
+                 s->rx_pending, reo ? reo->configured : -1,
+                 reo ? reo->enable : -1);
+    return ok;
 }
 
 static ssize_t wcn7850_nc_receive_iov(NetClientState *nc, const struct iovec *iov,
@@ -1302,6 +1310,70 @@ static NetClientInfo net_wcn7850_info = {
 
 /* ===== TX data path ===== */
 
+static uint16_t wcn7850_csum(const uint8_t *data, size_t len)
+{
+    uint32_t sum = 0;
+    while (len >= 2) {
+        sum += (data[0] << 8) | data[1];
+        data += 2;
+        len -= 2;
+    }
+    if (len) {
+        sum += data[0] << 8;
+    }
+    while (sum >> 16) {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    return ~sum;
+}
+
+static void wcn7850_fix_ip_checksum(uint8_t *f)
+{
+    f[24] = 0;
+    f[25] = 0;
+    uint16_t c = wcn7850_csum(f + 14, 20);
+    f[24] = c >> 8;
+    f[25] = c & 0xff;
+}
+
+static void wcn7850_fix_l4_checksum(uint8_t *f, size_t len)
+{
+    int ihl = (f[14] & 0x0f) * 4;
+    if (ihl < 20) {
+        return;
+    }
+    uint8_t proto = f[23];
+    if (proto != 0x06 && proto != 0x11) {
+        return;
+    }
+    uint8_t *t = f + 14 + ihl;
+    size_t tl = len - (14 + ihl);
+    if (proto == 0x06 && tl < 20) {
+        return;
+    }
+    if (proto == 0x11 && tl < 8) {
+        return;
+    }
+    if (proto == 0x11 && t[6] == 0 && t[7] == 0) {
+        return;
+    }
+    t[16] = 0;
+    t[17] = 0;
+    uint32_t ck = 0;
+    for (int i = 26; i + 1 < 34; i += 2) {
+        ck += (f[i] << 8) | f[i + 1];
+    }
+    ck += proto;
+    ck += tl;
+    ck += (uint16_t)~wcn7850_csum(t, tl);
+    while (ck >> 16) {
+        ck = (ck & 0xffff) + (ck >> 16);
+    }
+    ck = ~ck;
+    t[16] = ck >> 8;
+    t[17] = ck & 0xff;
+}
+
 static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
                                        WCN7850RingState *tcl)
 {
@@ -1328,6 +1400,12 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
 
     if (entries == 0) {
         return;
+    }
+
+    if (tp > hp || s->tx_trace_count++ % 64 == 0) {
+        qemu_log("WCN: TXDBG tcl%d hp=%u tp=%u es=%u rs=%u entries=%u %s\n",
+                 tcl->ring_id, hp, tp, entry_size, ring_size, entries,
+                 tp > hp ? "WRAP" : "");
     }
 
     if (entries > 64) entries = 64;
@@ -1392,7 +1470,43 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
                         frame = ethernet;
                     }
                 }
+                qemu_log("WCN: TX send len=%zu dst=%02x:%02x:%02x:%02x:%02x:%02x proto=%04x\n",
+                         ethernet_len, frame[0], frame[1], frame[2],
+                         frame[3], frame[4], frame[5],
+                         ethernet_len >= 14 ? le16_to_cpu(*(uint16_t *)(frame + 12)) : 0);
+                if (ethernet_len >= 34 && frame[12] == 0x08 && frame[13] == 0x00) {
+                    wcn7850_fix_ip_checksum((uint8_t *)frame);
+                    wcn7850_fix_l4_checksum((uint8_t *)frame, ethernet_len);
+                }
+                if (ethernet_len >= 34 && frame[12] == 0x08 && frame[13] == 0x00) {
+                    uint8_t ipproto = frame[23];
+                    int ihl = (frame[14] & 0x0f) * 4;
+                    if (ihl < 20) ihl = 20;
+                    if (ipproto == 0x06 && ethernet_len >= (uint32_t)(14 + ihl + 20)) {
+                        const uint8_t *t = frame + 14 + ihl;
+                        qemu_log("WCN: TX tcp sport=%u dport=%u seq=%02x%02x%02x%02x flags=%02x plen=%zu csum=%04x\n",
+                                 (t[0] << 8) | t[1], (t[2] << 8) | t[3],
+                                 t[4], t[5], t[6], t[7], t[13],
+                                 ethernet_len - (14 + ihl + 20),
+                                 (t[16] << 8) | t[17]);
+                    } else if (ipproto == 0x11 && ethernet_len >= (uint32_t)(14 + ihl + 8)) {
+                        const uint8_t *u = frame + 14 + ihl;
+                        qemu_log("WCN: TX udp sport=%u dport=%u len=%u\n",
+                                 (u[0] << 8) | u[1], (u[2] << 8) | u[3],
+                                 (u[4] << 8) | u[5]);
+                    }
+                }
+                if (++s->tx_dump_count % 250 == 0) {
+                    int hl = (buf_len >= 34 && (frame[14] & 0x0f) * 4 <= 60)
+                             ? (frame[14] & 0x0f) * 4 : 20;
+                    qemu_log("WCN: TX sample ip=%u.%u.%u.%u->%u.%u.%u.%u proto=%u tcp_payload_at=%d\n",
+                             frame[26], frame[27], frame[28], frame[29],
+                             frame[30], frame[31], frame[32], frame[33],
+                             frame[23], 14 + hl);
+                }
                 qemu_send_packet(nc, frame, ethernet_len);
+            } else {
+                qemu_log("WCN: TX drop (no peer) len=%u\n", (unsigned)buf_len);
             }
         }
 
@@ -1413,11 +1527,11 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
                     comp32[0] = 0;
                     comp32[1] = cpu_to_le32(tcl_info1);
                     comp32[2] = 0;
-                    comp32[3] = cpu_to_le32(1u << 24);
+                    comp32[3] = 0;
                     comp32[4] = cpu_to_le32((1u << 8) | (1u << 9));
                     comp32[5] = 0;
                     comp32[6] = 0;
-                    comp32[7] = 0;
+                    comp32[7] = cpu_to_le32((uint32_t)s->peer_id);
                     if (pci_dma_write(pci_dev, wbm->base_addr + whp,
                                       comp, sizeof(comp)) == MEMTX_OK) {
                         wbm->hp = next;
@@ -1433,20 +1547,23 @@ static void wcn7850_process_tcl_data(WCN7850State *s, PCIDevice *pci_dev,
         if (tp >= ring_size) tp = 0;
     }
 
-    /* Flush WBM HP once for the whole batch */
+    /* Flush WBM HP once for the whole batch. UMAC SRNG pointers are dword
+     * offsets; publish the byte HP divided by 4 so the driver compares it
+     * against its dword-units TP. */
     if (wbm_posted > 0 && wbm_ring) {
-        uint32_t hp_le = cpu_to_le32(wbm_ring->hp);
+        uint32_t hp_dw = wbm_ring->hp / 4;
+        uint32_t hp_le = cpu_to_le32(hp_dw);
         if (wbm_ring->hp_shadow_addr) {
             pci_dma_write(pci_dev, wbm_ring->hp_shadow_addr, &hp_le, sizeof(hp_le));
         }
-        *(uint32_t *)(s->bar0_always_on + wbm_ring->hp_mmio_offset) = wbm_ring->hp;
+        *(uint32_t *)(s->bar0_always_on + wbm_ring->hp_mmio_offset) = hp_dw;
         if (wbm_ring->msivec < WCN7850_MSI_VECTORS) {
             msi_notify(pci_dev, wbm_ring->msivec);
         }
     }
 
     tcl->tp = tp;
-    *(uint32_t *)(s->bar0_always_on + tcl->tp_mmio_offset) = tp;
+    *(uint32_t *)(s->bar0_always_on + tcl->tp_mmio_offset) = tp / 4;
 
     if (processed > 0) {
         fprintf(stderr, "WCN: TX ring=%u processed=%u wbm=%u\n",
@@ -3049,7 +3166,12 @@ static void wcn7850_handle_htt_cmd(WCN7850State *s, PCIDevice *pci_dev,
         uint32_t htt_ring_id   = (info0 >> 16) & 0xff;
         uint32_t pdev_id       = (info0 >> 8) & 0xff;
         uint64_t base_addr     = ((uint64_t)base_hi << 32) | base_lo;
-        uint32_t ring_size     = info1 & 0xffff;
+        /* The driver computes ring_size as num_entries * entry_sz where both
+         * are in dword units (see ath12k_dp_tx_htt_srng_setup), so the value
+         * is a dword count.  Convert to bytes to match the model's internal
+         * byte-unit ring offsets. */
+        uint32_t ring_size_dw  = info1 & 0xffff;
+        uint32_t ring_size     = ring_size_dw * 4;
         uint32_t entry_sz      = ((info1 >> 16) & 0xff) * 4;
         uint64_t hp_addr       = ((uint64_t)hp_hi << 32) | hp_lo;
         uint64_t tp_addr       = ((uint64_t)tp_hi << 32) | tp_lo;
@@ -4508,7 +4630,8 @@ static void wcn7850_handle_tcl_window_write(WCN7850State *s,
         if (win_off == hp_base + i * 4) {
             r = wcn7850_find_ring(s, WCN7850_RING_TCL_DATA, i);
             if (r) {
-                r->hp = (uint32_t)val;
+                qemu_log("WCN: TXDBG WINHP%d wr val=0x%x (dwords->%u)\n", i, (uint32_t)val, (uint32_t)val * 4);
+                r->hp = (uint32_t)val * 4;
                 if (r->configured && r->enable)
                     wcn7850_process_tcl_data(s, pci_dev, r);
             }
@@ -4993,7 +5116,8 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
             memcpy(s->bar0_always_on + addr, &val, size);
             WCN7850RingState *r = wcn7850_find_ring(s, WCN7850_RING_TCL_DATA, i);
             if (r) {
-                r->hp = val;
+                qemu_log("WCN: TXDBG R2HP%d wr val=0x%x (dwords->%u)\n", i, (uint32_t)val, (uint32_t)val * 4);
+                r->hp = val * 4;
                 if (r->configured && r->enable) {
                     wcn7850_process_tcl_data(s, pci_dev, r);
                 }
@@ -5004,7 +5128,8 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
             memcpy(s->bar0_always_on + addr, &val, size);
             WCN7850RingState *r = wcn7850_find_ring(s, WCN7850_RING_TCL_DATA, i);
             if (r) {
-                r->tp = val;
+                qemu_log("WCN: TXDBG R2TP%d wr val=0x%x (dwords->%u)\n", i, (uint32_t)val, (uint32_t)val * 4);
+                r->tp = val * 4;
             }
             return;
         }
@@ -5161,26 +5286,19 @@ static void wcn7850_mmio_write(void *opaque, hwaddr addr, uint64_t val, unsigned
                                 uint64_t buf_addr = info0 |
                                     ((uint64_t)(info1 & 0xff) << 32);
                                 uint32_t cookie = (info1 >> 12) & 0xfffff;
+                                /* The driver released this RX buffer back to
+                                 * the WBM.  Do NOT recycle it into the
+                                 * HW-facing RXDMA buf rings: the driver
+                                 * re-posts fresh buffers via SW2RXDMA_BUF0
+                                 * after reaping, and recycling here re-injects
+                                 * the same cookie forever (NULL-skb crash on
+                                 * the second reap before the driver refills).
+                                 * Merely acknowledge the release by advancing
+                                 * the TP below. */
                                 if (buf_addr) {
-                                    /* Return buffer to RXDMA buf ring 1 or 2 */
-                                    WCN7850RingState *rxr1 = wcn7850_find_ring(
-                                        s, WCN7850_RING_RXDMA_BUF, 1);
-                                    WCN7850RingState *rxr2 = wcn7850_find_ring(
-                                        s, WCN7850_RING_RXDMA_BUF, 2);
-                                    WCN7850RingState *target = NULL;
-                                    if (rxr1 && rxr1->num_bufs < WCN7850_RXDMA_MAX_BUFS)
-                                        target = rxr1;
-                                    else if (rxr2 && rxr2->num_bufs < WCN7850_RXDMA_MAX_BUFS)
-                                        target = rxr2;
-                                    if (target) {
-                                        target->buf_addrs[target->num_bufs] = buf_addr;
-                                        target->buf_cookies[target->num_bufs++] = cookie;
-                                        qemu_log("WCN: SW2WBM released buf=0x%"PRIx64
-                                                 " cookie=0x%x ring=%d n=%u\n",
-                                                 buf_addr, cookie,
-                                                 (int)(target - s->rings),
-                                                 target->num_bufs);
-                                    }
+                                    qemu_log("WCN: SW2WBM released buf=0x%"PRIx64
+                                             " cookie=0x%x (ack)\n",
+                                             buf_addr, cookie);
                                 }
                                 tp += esize;
                                 if (tp >= ring_bytes) tp = 0;
@@ -5376,8 +5494,11 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
         if (pci_dma_read(pci_dev, r->hp_shadow_addr, &hp_le, 4) != MEMTX_OK) {
             continue;
         }
+        /* The driver publishes the SRNG HP in dword offsets; the model's
+         * internal ring offsets are byte offsets.  Convert before comparing
+         * against the byte-units TP below. */
         uint32_t hp_val = le32_to_cpu(hp_le);
-        uint32_t hp = hp_val;
+        uint32_t hp = hp_val * 4;
         uint32_t tp = r->tp;
         uint32_t esize = r->entry_size ?: 8;
         uint32_t ring_bytes = r->size ?: (4096 * esize);
@@ -5407,11 +5528,21 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
         }
 
         int consumed = 0;
+        qemu_log("WCN: RXBUF ring%d hp_dw=%u hp=%u tp=%u esize=%u ring_bytes=%u num_entries=%d base=0x%"PRIx64"\n",
+                 r->ring_id, hp_val, hp, tp, esize, ring_bytes, num_entries, r->base_addr);
         for (int j = 0; j < num_entries; j++) {
             uint64_t desc_addr = r->base_addr + tp;
             uint8_t desc[8];
             if (pci_dma_read(pci_dev, desc_addr, desc, esize > 8 ? 8 : esize) != MEMTX_OK) {
                 break;
+            }
+            if (j < 12) {
+                qemu_log("WCN: RXBUF ring%d entry[%d] tp=%u lo=%08x hi=%08x addr=%"PRIx64" cookie=%x\n",
+                         r->ring_id, j, tp, le32_to_cpu(*(uint32_t *)desc),
+                         le32_to_cpu(*(uint32_t *)(desc + 4)),
+                         ((uint64_t)(le32_to_cpu(*(uint32_t *)(desc + 4)) & 0xff) << 32) |
+                         le32_to_cpu(*(uint32_t *)desc),
+                         le32_to_cpu(*(uint32_t *)(desc + 4)) >> 12);
             }
             uint64_t buf_addr;
             uint32_t buf_cookie = 0;
@@ -5440,7 +5571,8 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
 
         if (consumed > 0) {
             r->tp = tp;
-            uint32_t tp_le = cpu_to_le32(tp);
+            uint32_t tp_dw = tp / 4;
+            uint32_t tp_le = cpu_to_le32(tp_dw);
             if (r->tp_shadow_addr) {
                 pci_dma_write(pci_dev, r->tp_shadow_addr, &tp_le, sizeof(tp_le));
             }
@@ -5506,6 +5638,23 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
             } else {
                 g_assert_not_reached();
             }
+            if (pkt_len >= 34 && pkt_data[12] == 0x08 && pkt_data[13] == 0x00) {
+                uint8_t ipproto = pkt_data[23];
+                int ihl = (pkt_data[14] & 0x0f) * 4;
+                if (ihl < 20) ihl = 20;
+                if (ipproto == 0x06 && pkt_len >= (uint32_t)(14 + ihl + 20)) {
+                    const uint8_t *t = pkt_data + 14 + ihl;
+                    qemu_log("WCN: RX inj tcp sport=%u dport=%u seq=%02x%02x%02x%02x flags=%02x plen=%zu\n",
+                             (t[0] << 8) | t[1], (t[2] << 8) | t[3],
+                             t[4], t[5], t[6], t[7], t[13],
+                             pkt_len - (14 + ihl + 20));
+                } else if (ipproto == 0x11 && pkt_len >= (uint32_t)(14 + ihl + 8)) {
+                    const uint8_t *u = pkt_data + 14 + ihl;
+                    qemu_log("WCN: RX inj udp sport=%u dport=%u len=%u\n",
+                             (u[0] << 8) | u[1], (u[2] << 8) | u[3],
+                             (u[4] << 8) | u[5]);
+                }
+            }
 
             /* Driver-posted buffers may be ordinary guest DMA addresses rather
              * than addresses in the model's optional pool region. */
@@ -5539,7 +5688,7 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
               memcpy(rx_buf + 212, pkt_data, 6);
               memcpy(rx_buf + 218, pkt_data + 6, 6);
               memcpy(rx_buf + 224, pkt_data, 6);
-              memcpy(rx_buf + 148, &mpdu_start_tag, sizeof(mpdu_start_tag));
+              memcpy(rx_buf + 144, &mpdu_start_tag, sizeof(mpdu_start_tag));
               memcpy(rx_buf + rx_payload_offset, pkt_data, copy_size);
             if (copy_size >= 14 && pkt_data[12] == 0x08 && pkt_data[13] == 0x00)
                 s->rx_ipv4_count++;
@@ -5581,14 +5730,6 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
                 }
             }
             if (reo_dst && reo_dst->base_addr) {
-                uint32_t tp_le;
-
-                if (reo_dst->hp_shadow_addr &&
-                    pci_dma_read(pci_dev, reo_dst->hp_shadow_addr,
-                                 &tp_le, sizeof(tp_le)) == MEMTX_OK) {
-                    reo_dst->tp = le32_to_cpu(tp_le);
-                }
-                
                 uint32_t esize = reo_dst->entry_size ?: 32; /* REO DST entries are 32 bytes */
                 
                 /* Format the REO destination ring entry (32 bytes = 8 dwords).
@@ -5620,13 +5761,17 @@ static void wcn7850_poll_rxdma_buf_rings(WCN7850State *s, PCIDevice *pci_dev)
                 uint64_t write_addr = reo_dst->base_addr + reo_dst->hp;
                 pci_dma_write(pci_dev, write_addr, entry, esize);
                 
-                /* Advance HP and write to hp_shadow_addr (DST ring: HW writes HP) */
+                /* Advance HP and write to hp_shadow_addr (DST ring: HW writes HP).
+                 * UMAC SRNG pointers are dword offsets; the model's internal
+                 * byte offset must be divided by 4 before publishing to the
+                 * driver so it compares HP against its dword-units TP. */
                 reo_dst->hp += esize;
                 if (reo_dst->hp >= reo_dst->size) {
                     reo_dst->hp = 0;
                 }
                 
-                 uint32_t hp_le = cpu_to_le32(reo_dst->hp);
+                uint32_t hp_dw = reo_dst->hp / 4;
+                uint32_t hp_le = cpu_to_le32(hp_dw);
                 if (reo_dst->hp_shadow_addr) {
                     pci_dma_write(pci_dev, reo_dst->hp_shadow_addr, &hp_le, sizeof(hp_le));
                 }
@@ -5763,21 +5908,16 @@ static void wcn7850_ce_poll_timer(void *opaque)
                (12 + i) * sizeof(hp_shadow), sizeof(hp_shadow));
         memcpy(&hp_direct, s->bar0_always_on + WCN7850_TCL_RING_HP(i),
                sizeof(hp_direct));
-        hp_window = le32_to_cpu(hp_window);
+        /* Take the maximum of shadow/window/direct. The driver posts TX
+         * descriptors by writing the SRNG shadow (sidx 12+i); the R2
+         * window/direct registers are stale (0) for shadow-posted rings
+         * and must not override an advancing shadow. */
+        hp_window = le32_to_cpu(hp_window) * 4;
         hp_shadow = le32_to_cpu(hp_shadow) * 4;
         hp_direct = le32_to_cpu(hp_direct) * 4;
-        uint32_t hp = hp_window != tcl->hp ? hp_window :
-                      (hp_direct != tcl->hp ? hp_direct : hp_shadow);
-        if (hp == tcl->hp) {
-            uint32_t probe[2];
-            if (pci_dma_read(pci_dev, tcl->base_addr + tcl->tp,
-                             probe, sizeof(probe)) == MEMTX_OK &&
-                le32_to_cpu(probe[0]) != 0) {
-                hp = tcl->tp + tcl->entry_size;
-                if (hp >= tcl->size)
-                    hp = 0;
-            }
-        }
+        uint32_t hp = hp_shadow;
+        if (hp_window > hp) hp = hp_window;
+        if (hp_direct > hp) hp = hp_direct;
         if (hp != tcl->hp) {
             tcl->hp = hp;
             wcn7850_process_tcl_data(s, pci_dev, tcl);
